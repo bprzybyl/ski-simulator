@@ -21,7 +21,7 @@ Or run it locally: open `index.html` in a browser. There's no build step; it loa
 | P / Esc | Pause |
 | M | Mute |
 
-**On touch screens:** hold the left or right half of the screen to steer, let go to straighten out, and swipe up to jump. The icons in the top-right corner toggle sound, pause, and fullscreen (fullscreen isn't available on iPhone; use Add to Home Screen instead).
+**On touch screens:** put your right thumb down anywhere on the right half and drag it the way you want to ski (the spot you touch becomes the joystick's center). Pull down to tuck, pull up to brake, and let go to straighten out. Tap anywhere on the left half to jump. The icons in the top-right corner toggle sound, pause, and fullscreen (fullscreen isn't available on iPhone; use Add to Home Screen instead).
 
 Pick **Easy**, **Normal**, or **Hard** on the title screen (keys 1/2/3). Difficulty changes the wolves' speed, and each mode keeps its own best score.
 

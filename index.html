@@ -66,7 +66,9 @@ const TUNING = {
   touchCenterRate: 2.2,     // touch only: auto-straighten when not steering
   maxHeading: 1.35,         // rad (~77°)
   airControl: 0.4,
-  swipeJumpPx: 30,          // touch: upward swipe distance (UI units) that triggers a jump
+  stickRadius: 60,          // touch joystick: how far (UI units) the thumb pulls for full steer
+  stickTurnRate: 4,         // rad/s the skier eases toward the direction the stick points
+  stickDeadZone: 0.2,       // fraction of the radius that counts as 'no pull'
   // jumping
   jumpMs: 650, jumpHeight: 30, jumpCooldownMs: 150, jumpEnergyCost: 3,
   rampJumpMs: 1150, rampJumpHeight: 70,
@@ -457,7 +459,7 @@ class TitleScene extends Phaser.Scene {
 
     let y = 530;
     const line = (str, color = COLORS.text) => { fitText(addText(this, cx, y, str, 14, color, '700'), MENU_W - 24); y += 22; };
-    if (dev.input.touch) line('Hold LEFT / RIGHT side to steer  ·  Swipe UP to jump');
+    if (dev.input.touch) line('Right thumb: drag to steer  ·  Left thumb: tap to jump');
     if (dev.os.desktop || !dev.input.touch) {
       line('← →  steer     ↓  tuck     ↑  brake     SPACE  jump');
       line('P  pause     M  mute');
@@ -532,7 +534,7 @@ class GameScene extends Phaser.Scene {
     this.saidTired = false;
     this.usedKeyboard = false;
     this.touchUsed = false;
-    this.touchInput = { left: false, right: false };   // written by the HUD scene each frame
+    this.touchInput = null;   // joystick {x, y} in -1..1 while a thumb is down; written by the HUD scene
     this.trail = [];
     this.camX = 0;
     this.updateCamera(1);
@@ -596,11 +598,15 @@ class GameScene extends Phaser.Scene {
   isAir() { return this.elapsed < this.sk.airUntil; }
 
   readInput() {
-    const k = this.cursors, w = this.wasd, t = this.touchInput;
+    const k = this.cursors, w = this.wasd, st = this.touchInput;
+    const pulled = st && Math.hypot(st.x, st.y) > TUNING.stickDeadZone;
     return {
-      left: k.left.isDown || w.A.isDown || t.left, right: k.right.isDown || w.D.isDown || t.right,
-      up: k.up.isDown || w.W.isDown, down: k.down.isDown || w.S.isDown,
-      autoCenter: this.touchUsed && !this.usedKeyboard,
+      left: k.left.isDown || w.A.isDown, right: k.right.isDown || w.D.isDown,
+      // stick: pull up to brake, pull straight down to tuck
+      up: k.up.isDown || w.W.isDown || (pulled && st.y < -0.55),
+      down: k.down.isDown || w.S.isDown || (pulled && st.y > 0.6 && Math.abs(st.x) < 0.4),
+      stick: pulled ? st : null,
+      autoCenter: this.touchUsed && !this.usedKeyboard && !st,
     };
   }
 
@@ -628,7 +634,12 @@ class GameScene extends Phaser.Scene {
       const turn = T.turnRate * dt * (air ? T.airControl : 1);
       if (inp.left) s.heading -= turn;
       if (inp.right) s.heading += turn;
-      if (!air && inp.down) s.heading = approach(s.heading, 0, T.tuckRate * dt);
+      if (inp.stick) {
+        // The skier eases toward wherever the stick points (sideways at most), not a fixed turn rate
+        const target = Phaser.Math.Clamp(Math.atan2(inp.stick.x, Math.max(inp.stick.y, 0.15)), -T.maxHeading, T.maxHeading);
+        s.heading = approach(s.heading, target, T.stickTurnRate * dt * (air ? T.airControl : 1));
+      }
+      else if (!air && inp.down) s.heading = approach(s.heading, 0, T.tuckRate * dt);
       else if (inp.autoCenter && !inp.left && !inp.right) s.heading = approach(s.heading, 0, T.touchCenterRate * dt);
       s.heading = Phaser.Math.Clamp(s.heading, -T.maxHeading, T.maxHeading);
 
@@ -1035,8 +1046,6 @@ class HudScene extends Phaser.Scene {
     this.ready = false;
     this.g = this.scene.get('Game');
     this.shownScore = -1;
-    this.edgeL = this.add.rectangle(0, 0, 10, 10, COLORS.ski, 0).setOrigin(0);
-    this.edgeR = this.add.rectangle(0, 0, 10, 10, COLORS.ski, 0).setOrigin(1, 0);
     this.scoreText = addText(this, 0, 0, '0', 30, COLORS.text, '900').setOrigin(0, 0.5);
     this.distText = addText(this, 0, 0, '0 m', 16, COLORS.dim, '700').setOrigin(0, 0.5);
     this.diffText = addText(this, 0, 0, DIFFICULTIES[this.g.difficultyKey].label, 12, COLORS.dim, '800').setOrigin(0, 0.5);
@@ -1046,13 +1055,14 @@ class HudScene extends Phaser.Scene {
     this.wolfText = addText(this, 0, 0, '', 15, '#4a4e69', '900');
     this.corner = addCornerButtons(this, { pause: () => this.g.pause() });
 
-    this.setupTouch();
-    if (this.sys.game.device.input.touch) {
-      this.hint = this.add.text(0, 0, 'Hold LEFT or RIGHT side to steer\nSwipe UP to jump', {
+    this.touchUI = this.sys.game.device.input.touch;
+    if (this.touchUI) this.setupTouch();
+    if (this.touchUI) {
+      this.hint = this.add.text(0, 0, 'Right thumb: drag to steer\nLeft thumb: tap to JUMP', {
         fontFamily: FONT, fontSize: '17px', fontStyle: '800', color: COLORS.white, align: 'center',
         backgroundColor: 'rgba(29,36,51,0.78)', padding: { x: 16, y: 10 },
       }).setOrigin(0.5, 1).setResolution(textRes(this));
-      this.tweens.add({ targets: this.hint, alpha: 0, delay: 4500, duration: 600, onComplete: () => this.hint.setVisible(false) });
+      this.tweens.add({ targets: this.hint, alpha: 0, delay: 5000, duration: 600, onComplete: () => this.hint.setVisible(false) });
     }
     this.layout();
     onViewChange(this, () => this.layout());
@@ -1072,49 +1082,81 @@ class HudScene extends Phaser.Scene {
     this.buttText.setPosition(cx, T + 52);
     this.wolfText.setPosition(cx, T + 73);
     this.corner.layout(uw - 8 - sa.right, T + 26);
-    this.edgeL.setPosition(0, 0).setSize(44, uh);
-    this.edgeR.setPosition(uw, 0).setSize(44, uh);
-    if (this.hint) this.hint.setPosition(cx, uh - 40 - sa.bottom);
+    // Resting spots for the thumb controls: joystick lower-right, jump lower-left
+    this.stickRest = { x: uw - 95 - sa.right, y: uh - 130 - sa.bottom };
+    this.jumpRest = { x: 95 + sa.left, y: uh - 130 - sa.bottom };
+    if (this.touchUI) {
+      this.jumpBtn.setPosition(this.jumpRest.x, this.jumpRest.y);
+      this.jumpLabel.setPosition(this.jumpRest.x, this.jumpRest.y);
+    }
+    if (this.hint) this.hint.setPosition(cx, this.stickRest.y - 90);
     this.bannerY = uh * 0.42;
     this.corner.setDepth(10);
   }
 
-  // Thumb zones: hold the left/right half to steer, swipe up to jump
+  // Floating joystick on the right half (thumb-down point becomes the center; pull to steer),
+  // tap anywhere on the left half to jump
   setupTouch() {
-    this.touches = new Map();
+    const R = TUNING.stickRadius;
+    this.stick = null;
+    this.jumpBtn = this.add.circle(0, 0, 48, COLORS.ink, 0.14).setStrokeStyle(3, 0xffffff, 0.8);
+    this.jumpLabel = addText(this, 0, 0, 'JUMP', 17, COLORS.white, '900').setAlpha(0.9);
+    this.stickBase = this.add.circle(0, 0, R, COLORS.ink, 0.12).setStrokeStyle(3, 0xffffff, 0.8);
+    this.stickKnob = this.add.circle(0, 0, 26, 0xffffff, 0.85).setStrokeStyle(2, COLORS.ink, 0.25);
+
+    const toUi = p => ({ x: p.x / View.uiZoom, y: p.y / View.uiZoom });
     this.input.on('pointerdown', p => {
       Sfx.unlock();
-      this.touches.set(p.id, { x0: p.x, y0: p.y, swiped: false });
-      if (p.wasTouch) this.g.touchUsed = true;
+      this.g.touchUsed = true;
+      const u = toUi(p);
+      if (u.x < View.uw / 2) {
+        this.g.jump();
+        this.jumpBtn.setPosition(u.x, u.y);
+        this.jumpLabel.setPosition(u.x, u.y);
+        this.tweens.killTweensOf([this.jumpBtn, this.jumpLabel]);
+        this.jumpBtn.setScale(0.8).setFillStyle(COLORS.jacket, 0.5);
+        this.tweens.add({ targets: this.jumpBtn, scale: 1, duration: 160, ease: 'Back.Out' });
+        this.time.delayedCall(260, () => {
+          this.jumpBtn.setFillStyle(COLORS.ink, 0.14);
+          this.tweens.add({ targets: [this.jumpBtn, this.jumpLabel], x: this.jumpRest.x, y: this.jumpRest.y, duration: 250 });
+        });
+      } else if (!this.stick) {
+        this.stick = { id: p.id, bx: u.x, by: u.y, x: 0, y: 0 };
+      }
     });
     this.input.on('pointermove', p => {
-      const t = this.touches.get(p.id);
-      if (!t || t.swiped || !p.isDown) return;
-      const up = (t.y0 - p.y) / View.uiZoom, side = Math.abs(p.x - t.x0) / View.uiZoom;
-      if (up > TUNING.swipeJumpPx && up > side) { t.swiped = true; this.g.jump(); }
+      const st = this.stick;
+      if (!st || p.id !== st.id) return;
+      const u = toUi(p);
+      let dx = u.x - st.bx, dy = u.y - st.by;
+      const len = Math.hypot(dx, dy);
+      if (len > R) {           // thumb went past the rim: drag the base along so you never run out of stick
+        st.bx += dx * (1 - R / len); st.by += dy * (1 - R / len);
+        dx = u.x - st.bx; dy = u.y - st.by;
+      }
+      st.x = dx / R; st.y = dy / R;
     });
-    const end = p => this.touches.delete(p.id);
+    const end = p => { if (this.stick && p.id === this.stick.id) this.stick = null; };
     this.input.on('pointerup', end);
     this.input.on('pointerupoutside', end);
+    this.events.on(Phaser.Scenes.Events.RESUME, () => { this.stick = null; });   // a release during pause is never seen
   }
 
-  readTouch() {
-    let left = false, right = false;
-    for (const p of this.input.manager.pointers) {
-      const t = p.isDown && this.touches.get(p.id);
-      if (!t || t.swiped) continue;
-      if (p.x < View.w / 2) left = true; else right = true;
-    }
-    return { left, right };
+  drawStick() {
+    const st = this.stick, R = TUNING.stickRadius;
+    const bx = st ? st.bx : this.stickRest.x, by = st ? st.by : this.stickRest.y;
+    this.stickBase.setPosition(bx, by).setAlpha(st ? 1 : 0.55);
+    this.stickKnob.setPosition(bx + (st ? st.x * R : 0), by + (st ? st.y * R : 0)).setAlpha(st ? 1 : 0.55);
+    this.jumpBtn.setAlpha(st || this.jumpBtn.scale < 1 ? 1 : 0.8);
   }
 
   update() {
     const g = this.g, s = g.sk, T = TUNING;
     if (!s) return;
-    const touch = this.readTouch();
-    g.touchInput = touch;
-    this.edgeL.fillAlpha = touch.left ? 0.1 : 0;
-    this.edgeR.fillAlpha = touch.right ? 0.1 : 0;
+    if (this.touchUI) {
+      g.touchInput = this.stick ? { x: this.stick.x, y: this.stick.y } : null;
+      this.drawStick();
+    }
 
     const sc = g.score();
     if (sc !== this.shownScore) { this.shownScore = sc; this.scoreText.setText(sc); }
