@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Ski Simulator</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #c9d6e3; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  #game { width: 100vw; height: 100vh; height: 100dvh; }
+  canvas { display: block; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.90.0/dist/phaser.min.js"></script>
+</head>
+<body>
+<div id="game"></div>
+<script>
+'use strict';
+/* =====================================================================
+   1. CONFIG & TUNING — every tweakable number lives here
+   ===================================================================== */
+const GAME_ID = 'ski-simulator';
+const WIDTH = 800, HEIGHT = 600;
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+const COLORS = {
+  snow: 0xf3f7fb, snowShade: 0xdde7f0, track: 0xcfdbe7,
+  jacket: 0xe63946, pants: 0x3a5a9b, skin: 0xf2c9a0, beanie: 0xffb703, ski: 0x1d3557,
+  tree: 0x40916c, treeDark: 0x1b4332, trunk: 0x7f5539, rock: 0x9aa5b8, rockDark: 0x5c677d,
+  apple: 0xe5383b, leaf: 0x52b788, wolf: 0x5a5a72, wolfDark: 0x2b2b3d, eye: 0xff3b3b,
+  ramp: 0xa9def9, rampDark: 0x5fa8d3, flagRed: 0xe63946, flagBlue: 0x3a86ff,
+  text: '#1d2433', dim: '#5c677d', accent: '#e63946', gold: '#e09f00', white: '#ffffff',
+};
+
+const DEPTH = { deco: -20, trail: -10, fx: 1e8, pop: 1e8 + 5, bubble: 1e8 + 10, hud: 1e9 };
+
+const TUNING = {
+  skierScreenY: 0.3,        // skier sits this far down the screen
+  pxPerMeter: 10,
+  // skiing
+  maxSpeed: 430,            // px/s straight downhill with full energy
+  accel: 260,               // px/s² toward target speed
+  brakeDecel: 700,
+  tuckBonus: 1.1,           // ↓ held: a bit faster
+  turnRate: 2.6,            // rad/s
+  tuckRate: 5,              // rad/s back to straight while holding ↓
+  touchCenterRate: 2.2,     // touch only: auto-straighten when not steering
+  maxHeading: 1.35,         // rad (~77°)
+  airControl: 0.4,
+  // jumping
+  jumpMs: 650, jumpHeight: 30, jumpCooldownMs: 150, jumpEnergyCost: 3,
+  rampJumpMs: 1150, rampJumpHeight: 70,
+  // energy
+  energyDrainPerSec: 3.2,
+  tiredThreshold: 35,       // below this he slows down
+  tiredSpeedMin: 0.55,      // speed multiplier at 0 energy
+  // crashes
+  crashMs: 900, invulnMs: 900, crashEnergyCost: 5,
+  // apple break: eat → realize → go
+  breakEatMs: 1000, breakRealizeMs: 600, breakGoMs: 450,
+  boostMs: 3500, boostMult: 1.45,
+  buttBase: 0.55, buttGrow: 0.4, buttMax: 6, buttSpeedBonus: 0.04,
+  // dire wolves
+  wolfArriveMs: 15000, wolfStartGap: 700, wolfMaxGap: 1500, wolfCatchGap: 22,
+  wolfSpeed: [300, 425], wolfRampSeconds: 150, wolfCount: 4,
+  // world
+  clearStartPx: 380, firstApplePx: 2600,
+  rowSpacing: [95, 58],     // px between obstacle rows [start, hardest]
+  appleEveryPx: [3000, 4200],
+  spawnHalfWidth: 950,
+  rampSeconds: 120,         // time to reach full difficulty
+  chance: { ramp: 0.06, gate: 0.05, rock: 0.24, stump: 0.1, forest: 0.08 },
+  pts: { jumpOver: 15, ramp: 50, gate: 25, apple: 10 },
+  appleRadius: 52,          // pickup radius (px) — generous on purpose
+};
+
+// Wolf speed per difficulty; NORMAL is the original tuning
+const DIFFICULTIES = {
+  easy:   { label: 'EASY',   blurb: 'Slower wolves',   wolfSpeedMult: 0.88 },
+  normal: { label: 'NORMAL', blurb: 'The classic hunt', wolfSpeedMult: 1 },
+  hard:   { label: 'HARD',   blurb: 'Hungrier wolves', wolfSpeedMult: 1.1 },
+};
+const DIFF_KEYS = Object.keys(DIFFICULTIES);
+const getBest = diff => Store.get('best_' + diff, diff === 'normal' ? Store.get('best', 0) : 0);
+
+/* =====================================================================
+   2. HELPERS — storage and synthesized sound effects
+   ===================================================================== */
+const Store = {
+  get(key, fallback) {
+    try { const v = localStorage.getItem(GAME_ID + ':' + key);
+          return v === null ? fallback : JSON.parse(v); }
+    catch (e) { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(GAME_ID + ':' + key, JSON.stringify(value)); } catch (e) {}
+  },
+};
+
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false),
+  presets: {
+    jump:   { wave: 'triangle', f0: 320, f1: 720,  dur: 0.16, vol: 0.22 },
+    land:   { wave: 'noise',    f0: 160, f1: 60,   dur: 0.14, vol: 0.25 },
+    crash:  { wave: 'noise',    f0: 500, f1: 50,   dur: 0.45, vol: 0.40 },
+    crunch: { wave: 'noise',    f0: 900, f1: 250,  dur: 0.07, vol: 0.30 },
+    boing:  { wave: 'sine',     f0: 140, f1: 520,  dur: 0.30, vol: 0.32 },
+    whoosh: { wave: 'noise',    f0: 150, f1: 700,  dur: 0.40, vol: 0.20 },
+    ramp:   { wave: 'triangle', f0: 220, f1: 980,  dur: 0.35, vol: 0.25 },
+    gate:   { wave: 'square',   f0: 880, f1: 1320, dur: 0.10, vol: 0.14 },
+    bonus:  { wave: 'square',   f0: 660, f1: 990,  dur: 0.09, vol: 0.12 },
+    howlUp: { wave: 'sine',     f0: 360, f1: 640,  dur: 0.70, vol: 0.16 },
+    howlDn: { wave: 'sine',     f0: 640, f1: 430,  dur: 0.90, vol: 0.16 },
+    growl:  { wave: 'sawtooth', f0: 110, f1: 60,   dur: 0.50, vol: 0.20 },
+    start:  { wave: 'triangle', f0: 330, f1: 880,  dur: 0.25, vol: 0.25 },
+    over:   { wave: 'sawtooth', f0: 300, f1: 60,   dur: 0.70, vol: 0.20 },
+    click:  { wave: 'sine',     f0: 800, f1: 600,  dur: 0.05, vol: 0.20 },
+  },
+  unlock() {
+    try {
+      if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+    } catch (e) {}
+  },
+  play(name, pitch = 1) {
+    const p = this.presets[name];
+    if (!p || this.muted || !this.ctx) return;
+    const ctx = this.ctx, t = ctx.currentTime;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(p.vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + p.dur);
+    gain.connect(ctx.destination);
+    let src;
+    if (p.wave === 'noise') {
+      const buf = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * p.dur), ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      src = ctx.createBufferSource(); src.buffer = buf;
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(p.f0 * pitch * 4, t);
+      filter.frequency.exponentialRampToValueAtTime(Math.max(20, p.f1 * pitch * 4), t + p.dur);
+      src.connect(filter); filter.connect(gain);
+    } else {
+      src = ctx.createOscillator(); src.type = p.wave;
+      src.frequency.setValueAtTime(p.f0 * pitch, t);
+      src.frequency.exponentialRampToValueAtTime(Math.max(20, p.f1 * pitch), t + p.dur);
+      src.connect(gain);
+    }
+    src.start(t); src.stop(t + p.dur + 0.02);
+  },
+  toggleMute() { this.muted = !this.muted; Store.set('muted', this.muted); return this.muted; },
+};
+
+const lerp = (a, b, t) => a + (b - a) * Phaser.Math.Clamp(t, 0, 1);
+const approach = (v, target, step) => v < target ? Math.min(target, v + step) : Math.max(target, v - step);
+const pick = arr => Phaser.Utils.Array.GetRandom(arr);
+// The butt texture is drawn at BUTT_RES× detail and scaled down, so it stays crisp even when huge
+const BUTT_RES = 4;
+const buttScale = lvl => (TUNING.buttBase + TUNING.buttGrow * lvl) / BUTT_RES;
+
+// Hi-DPI text only under WebGL; the Canvas renderer draws resolution>1 text at double size
+const textRes = scene => scene.sys.game.renderer.type === Phaser.WEBGL ? 2 : 1;
+
+function addText(scene, x, y, str, size = 24, color = COLORS.text, weight = '600') {
+  return scene.add.text(x, y, str, {
+    fontFamily: FONT, fontSize: size + 'px', fontStyle: weight, color, align: 'center',
+  }).setOrigin(0.5).setResolution(textRes(scene));
+}
+
+function addMuteButton(scene) {
+  const label = m => m ? '♪ MUTED' : '♪ SOUND';
+  const btn = addText(scene, WIDTH - 16, 24, label(Sfx.muted), 15, COLORS.dim, '800').setOrigin(1, 0.5)
+    .setInteractive({ useHandCursor: true }).setDepth(DEPTH.hud).setScrollFactor(0);
+  const toggle = () => { btn.setText(label(Sfx.toggleMute())); };
+  btn.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); toggle(); });
+  scene.input.keyboard.on('keydown-M', toggle);
+  return btn;
+}
+
+/* The skier is a container so his butt can grow independently */
+function makeSkier(scene, x, y) {
+  const butt = scene.add.image(0, -12, 'butt').setScale(buttScale(0));
+  const skis = scene.add.image(0, 0, 'skis');
+  const body = scene.add.image(0, 0, 'skierBody').setOrigin(0.5, 0.94);
+  const c = scene.add.container(x, y, [butt, skis, body]);   // butt behind skis so a huge one doesn't hide them
+  return { c, skis, butt, body };
+}
+
+/* =====================================================================
+   3. TEXTURES — all art generated in code, no image files
+   ===================================================================== */
+function makeTextures(scene) {
+  const g = scene.make.graphics({ x: 0, y: 0 }, false);
+  const tex = (key, w, h, draw) => { g.clear(); draw(g); g.generateTexture(key, w, h); };
+
+  tex('skis', 24, 46, g => {
+    g.fillStyle(COLORS.ski).fillRoundedRect(4, 2, 5, 42, 2).fillRoundedRect(15, 2, 5, 42, 2);
+    g.fillStyle(0xffffff, 0.4).fillRect(5, 36, 3, 6).fillRect(16, 36, 3, 6);
+  });
+  tex('skierBody', 40, 50, g => {
+    g.lineStyle(2, 0x555555).lineBetween(6, 27, 1, 47).lineBetween(34, 27, 39, 47);   // poles
+    g.fillStyle(COLORS.pants).fillRoundedRect(12, 30, 7, 17, 3).fillRoundedRect(21, 30, 7, 17, 3);
+    g.fillStyle(COLORS.jacket).fillRoundedRect(4, 18, 8, 11, 4).fillRoundedRect(28, 18, 8, 11, 4);
+    g.fillStyle(COLORS.jacket).fillRoundedRect(10, 16, 20, 18, 6);
+    g.fillStyle(0xffffff, 0.35).fillRect(10, 24, 20, 3);                              // jacket stripe
+    g.fillStyle(COLORS.ski).fillCircle(6, 28, 3).fillCircle(34, 28, 3);               // gloves
+    g.fillStyle(COLORS.skin).fillCircle(20, 11, 7);
+    g.fillStyle(COLORS.beanie).fillRect(13, 3, 14, 6).fillCircle(20, 2, 3);
+    g.fillStyle(COLORS.ski).fillRoundedRect(14, 9, 12, 4, 2);                         // goggles
+    g.fillStyle(0x8ecae6).fillRect(15, 10, 4, 2).fillRect(21, 10, 4, 2);
+  });
+  tex('butt', 36 * BUTT_RES, 26 * BUTT_RES, g => {
+    const k = BUTT_RES;
+    g.fillStyle(0x1f3563).fillCircle(11 * k, 14 * k, 10.5 * k).fillCircle(25 * k, 14 * k, 10.5 * k);   // outline/underside
+    g.fillStyle(0x2b4478).fillCircle(11 * k, 13 * k, 10 * k).fillCircle(25 * k, 13 * k, 10 * k);
+    g.fillStyle(COLORS.pants).fillCircle(11 * k, 11.5 * k, 9.5 * k).fillCircle(25 * k, 11.5 * k, 9.5 * k);
+    g.fillStyle(0x4a6db3).fillEllipse(10 * k, 8 * k, 11 * k, 7 * k).fillEllipse(24 * k, 8 * k, 11 * k, 7 * k);
+    g.fillStyle(0xffffff, 0.3).fillEllipse(8 * k, 6.5 * k, 4.5 * k, 2.5 * k).fillEllipse(22 * k, 6.5 * k, 4.5 * k, 2.5 * k);
+    g.lineStyle(0.8 * k, 0x1f3563, 0.7).lineBetween(18 * k, 5 * k, 18 * k, 20 * k);                     // seam
+  });
+  tex('shadow', 34, 12, g => { g.fillStyle(0x000000, 0.18).fillEllipse(17, 6, 34, 12); });
+
+  tex('tree', 56, 80, g => {
+    g.fillStyle(0x000000, 0.1).fillEllipse(32, 74, 44, 10);
+    g.fillStyle(COLORS.trunk).fillRect(24, 60, 8, 14);
+    const tier = (top, bottom, half) => {
+      g.fillStyle(COLORS.treeDark).fillTriangle(28, top, 28 - half, bottom, 28 + half, bottom);
+      g.fillStyle(COLORS.tree).fillTriangle(28, top, 28, bottom, 28 + half, bottom);
+    };
+    tier(22, 64, 26); tier(8, 44, 21); tier(0, 26, 16);
+    g.fillStyle(0xffffff, 0.9).fillTriangle(28, 0, 22, 10, 34, 10);
+  });
+  tex('rock', 40, 28, g => {
+    g.fillStyle(0x000000, 0.1).fillEllipse(22, 22, 38, 10);
+    g.fillStyle(COLORS.rockDark).fillEllipse(20, 16, 36, 22);
+    g.fillStyle(COLORS.rock).fillEllipse(18, 13, 30, 18);
+    g.fillStyle(0xffffff, 0.85).fillEllipse(16, 7, 16, 6);
+  });
+  tex('stump', 30, 26, g => {
+    g.fillStyle(0x000000, 0.1).fillEllipse(16, 21, 28, 8);
+    g.fillStyle(0x6b4423).fillRect(5, 9, 20, 11).fillEllipse(15, 20, 20, 6);
+    g.fillStyle(0xc89f6d).fillEllipse(15, 9, 20, 8);
+    g.lineStyle(1, 0x8a6440).strokeEllipse(15, 9, 10, 4);
+  });
+  tex('ramp', 64, 34, g => {
+    g.fillStyle(0x000000, 0.1).fillEllipse(32, 30, 62, 8);
+    g.fillStyle(COLORS.rampDark).fillRect(4, 14, 56, 14);
+    g.fillStyle(COLORS.ramp).fillRoundedRect(4, 2, 56, 16, 4);
+    g.fillStyle(0xffffff, 0.7).fillRect(10, 6, 44, 2).fillRect(10, 11, 44, 2);
+  });
+  tex('apple', 50, 54, g => {
+    g.fillStyle(0x000000, 0.12).fillEllipse(25, 48, 38, 10);
+    g.fillStyle(0xffffff).fillCircle(18, 29, 17).fillCircle(32, 29, 17);          // white outline pops on snow
+    g.fillStyle(0xa4161a).fillCircle(18, 29, 15).fillCircle(32, 29, 15);
+    g.fillStyle(COLORS.apple).fillCircle(18, 26, 14).fillCircle(32, 26, 14);
+    g.fillStyle(0xffffff, 0.55).fillCircle(14, 19, 4);
+    g.fillStyle(0x6b4423).fillRect(23, 4, 4, 11);
+    g.fillStyle(COLORS.leaf).fillEllipse(34, 8, 15, 8);
+  });
+  tex('appleGlow', 96, 96, g => {
+    for (let r = 48; r > 0; r -= 6) g.fillStyle(0xffd166, 0.07).fillCircle(48, 48, r);
+  });
+  const flag = (key, color) => tex(key, 24, 44, g => {
+    g.fillStyle(0x000000, 0.12).fillEllipse(6, 41, 12, 4);
+    g.fillStyle(0x444444).fillRect(2, 2, 3, 40);
+    g.fillStyle(color).fillTriangle(5, 3, 22, 10, 5, 17);
+  });
+  flag('flagR', COLORS.flagRed); flag('flagB', COLORS.flagBlue);
+  tex('bump', 44, 16, g => {
+    g.fillStyle(COLORS.snowShade).fillEllipse(22, 10, 42, 12);
+    g.fillStyle(0xffffff).fillEllipse(20, 7, 34, 8);
+  });
+
+  // Dire wolf, seen from above, running downhill (head at the bottom). Two leg frames.
+  const wolf = (key, f) => tex(key, 44, 64, g => {
+    const s = f ? 1 : -1;
+    g.fillStyle(0x000000, 0.12).fillEllipse(24, 34, 32, 50);
+    g.fillStyle(COLORS.wolfDark).fillTriangle(22, 0, 15, 17, 29, 17);                 // tail
+    g.fillRoundedRect(7, 14 + s * 4, 6, 14, 3).fillRoundedRect(31, 14 - s * 4, 6, 14, 3);
+    g.fillRoundedRect(7, 32 - s * 4, 6, 14, 3).fillRoundedRect(31, 32 + s * 4, 6, 14, 3);
+    g.fillStyle(COLORS.wolf).fillEllipse(22, 28, 26, 36);
+    g.fillStyle(COLORS.wolfDark, 0.55).fillEllipse(22, 24, 10, 26);
+    g.fillStyle(COLORS.wolf).fillEllipse(22, 46, 20, 18);
+    g.fillStyle(COLORS.wolfDark).fillTriangle(12, 43, 14, 32, 20, 40).fillTriangle(32, 43, 30, 32, 24, 40);
+    g.fillStyle(0x9a8c98).fillEllipse(22, 54, 11, 12);
+    g.fillStyle(0x111111).fillCircle(22, 59, 2.5);
+    g.fillStyle(COLORS.eye).fillCircle(17, 45, 2.3).fillCircle(27, 45, 2.3);
+    g.fillStyle(0xffffff).fillTriangle(18, 58, 20, 58, 19, 62).fillTriangle(24, 58, 26, 58, 25, 62);
+  });
+  wolf('wolf0', 0); wolf('wolf1', 1);
+
+  tex('spark', 8, 8, g => { g.fillStyle(0xffffff).fillCircle(4, 4, 4); });
+  g.destroy();
+}
+
+/* =====================================================================
+   4. SCENES
+   ===================================================================== */
+class BootScene extends Phaser.Scene {
+  constructor() { super('Boot'); }
+  create() { makeTextures(this); this.scene.start('Title'); }
+}
+
+class TitleScene extends Phaser.Scene {
+  constructor() { super('Title'); }
+  create() {
+    this.cameras.main.setBackgroundColor(COLORS.snow);
+    [[70, 140], [90, 330], [730, 250], [770, 615], [30, 615], [230, 60], [620, 60]].forEach(([x, y]) =>
+      this.add.image(x, y, 'tree').setOrigin(0.5, 0.9).setDepth(y));
+    this.add.image(610, 300, 'rock').setDepth(300);
+
+    addText(this, WIDTH / 2, HEIGHT * 0.17, 'SKI SIMULATOR', 66, COLORS.text, '900').setDepth(1000);
+    addText(this, WIDTH / 2, HEIGHT * 0.17 + 52, 'Outski the dire wolves. Eat apples. Deal with the consequences.', 18, COLORS.dim)
+      .setDepth(1000);
+
+    const sk = makeSkier(this, WIDTH / 2, HEIGHT * 0.54);
+    this.add.image(WIDTH / 2, HEIGHT * 0.54 + 2, 'shadow');
+    this.tweens.add({ targets: sk.c, x: WIDTH / 2 + 50, duration: 900, yoyo: true, repeat: -1, ease: 'Sine.InOut',
+      onUpdate: () => { const r = (sk.c.x - WIDTH / 2 - 25) / 25; sk.skis.rotation = -r * 0.5; sk.body.rotation = -r * 0.2; } });
+    const wolves = [-60, 0, 60].map((dx, i) =>
+      this.add.image(WIDTH / 2 + dx, HEIGHT * 0.54 - 80 - (i % 2) * 18, 'wolf0').setScale(1.1));
+    this.time.addEvent({ delay: 120, loop: true, callback: () =>
+      wolves.forEach((w, i) => w.setTexture((Math.floor(this.time.now / 120) + i) % 2 ? 'wolf1' : 'wolf0')) });
+
+    this.makeDifficultyPicker(HEIGHT * 0.655);
+    const prompt = addText(this, WIDTH / 2, HEIGHT * 0.77, 'Press SPACE or tap to start', 26, COLORS.accent, '800');
+    this.tweens.add({ targets: prompt, alpha: 0.3, duration: 700, yoyo: true, repeat: -1 });
+    addText(this, WIDTH / 2, HEIGHT * 0.835, '← →  steer     ↓  tuck     ↑  brake     SPACE  jump     P  pause     M  mute',
+      16, COLORS.text, '700');
+    addText(this, WIDTH / 2, HEIGHT * 0.9,
+      'Jump rocks and stumps. Hit ramps for big air. Trees always win.\nApples restore energy... but he WILL stop to eat them.', 15, COLORS.dim);
+    addMuteButton(this);
+
+    const start = () => { Sfx.unlock(); Sfx.play('start'); this.scene.start('Game', { difficulty: this.diff }); };
+    this.input.keyboard.once('keydown-SPACE', start);
+    this.input.keyboard.once('keydown-ENTER', start);
+    this.input.once('pointerdown', start);
+  }
+
+  makeDifficultyPicker(y) {
+    this.diff = Store.get('difficulty', 'normal');
+    if (!DIFFICULTIES[this.diff]) this.diff = 'normal';
+    const w = 124, h = 38, gap = 14, x0 = WIDTH / 2 - (w + gap);
+    const caption = addText(this, WIDTH / 2, y + 36, '', 15, COLORS.dim, '700');
+    const btns = DIFF_KEYS.map((key, i) => {
+      const x = x0 + i * (w + gap);
+      const bg = this.add.graphics();
+      const label = addText(this, x, y, (i + 1) + '  ' + DIFFICULTIES[key].label, 17, COLORS.text, '900');
+      const zone = this.add.zone(x, y, w, h).setInteractive({ useHandCursor: true });
+      zone.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); select(key); });
+      return { key, x, bg, label };
+    });
+    const select = key => {
+      if (key !== this.diff) { Sfx.unlock(); Sfx.play('click'); }
+      this.diff = key;
+      Store.set('difficulty', key);
+      btns.forEach(b => {
+        const on = b.key === key;
+        b.bg.clear().fillStyle(on ? COLORS.jacket : 0xffffff, on ? 1 : 0.85).fillRoundedRect(b.x - w / 2, y - h / 2, w, h, 10);
+        if (!on) b.bg.lineStyle(2, 0x1d2433, 0.2).strokeRoundedRect(b.x - w / 2, y - h / 2, w, h, 10);
+        b.label.setColor(on ? COLORS.white : COLORS.text);
+        if (on) this.tweens.add({ targets: b.label, scale: { from: 1.15, to: 1 }, duration: 160 });
+      });
+      const best = getBest(key);
+      caption.setText(DIFFICULTIES[key].blurb + (best > 0 ? '   ·   Best: ' + best : ''));
+    };
+    select(this.diff);
+    ['ONE', 'TWO', 'THREE'].forEach((k, i) => this.input.keyboard.on('keydown-' + k, () => select(DIFF_KEYS[i])));
+    const step = dir => select(DIFF_KEYS[(DIFF_KEYS.indexOf(this.diff) + dir + DIFF_KEYS.length) % DIFF_KEYS.length]);
+    this.input.keyboard.on('keydown-LEFT', () => step(-1));
+    this.input.keyboard.on('keydown-RIGHT', () => step(1));
+  }
+}
+
+class GameScene extends Phaser.Scene {
+  constructor() { super('Game'); }
+  init(data) { this.difficultyKey = (data && data.difficulty) || Store.get('difficulty', 'normal'); }
+
+  create() {
+    const cam = this.cameras.main;
+    cam.setBackgroundColor(COLORS.snow);
+    cam.setScroll(-WIDTH / 2, -HEIGHT * TUNING.skierScreenY);
+    this.elapsed = 0;
+    this.over = false;
+    this.bonus = 0;
+    this.apples = 0;
+    this.shownScore = -1;
+    this.sk = {
+      x: 0, y: 0, heading: 0, speed: 0, vy: 0, state: 'ski', energy: 100, butt: 0,
+      airStart: 0, airDur: 1, airUntil: -1, rampAir: false, wasAir: false, jumpReadyAt: 0,
+      crashUntil: 0, crashDir: 1, invulnUntil: 0, boostUntil: -1,
+    };
+    this.objs = [];
+    this.nextRowY = TUNING.clearStartPx;
+    this.nextAppleY = TUNING.firstApplePx;
+    this.wolvesActive = false;
+    this.gap = TUNING.wolfStartGap;
+    this.wolfSpeed = 0;
+    this.nextGrowlAt = 0;
+    this.nextHuffAt = 0;
+    this.saidTired = false;
+    this.usedKeyboard = false;
+    this.trail = [];
+
+    // World: trail, skier, wolves
+    this.trailG = this.add.graphics().setDepth(DEPTH.trail);
+    this.shadow = this.add.image(0, 0, 'shadow');
+    const sk = makeSkier(this, 0, 0);
+    this.skier = sk.c; this.skis = sk.skis; this.buttImg = sk.butt; this.skBody = sk.body;
+
+    this.wolves = [];
+    for (let i = 0; i < TUNING.wolfCount; i++) {
+      const w = this.add.image(0, -9999, 'wolf0').setScale(1.15).setVisible(false);
+      w.ox = (i - (TUNING.wolfCount - 1) / 2) * 46 + Phaser.Math.Between(-8, 8);
+      w.oy = Phaser.Math.Between(0, 30) + (i % 2) * 26;
+      w.phase = Phaser.Math.Between(0, 1000);
+      w.wx = 0;
+      this.wolves.push(w);
+    }
+
+    const fx = tint => this.add.particles(0, 0, 'spark', {
+      speed: { min: 40, max: 170 }, lifespan: 480, scale: { start: 0.9, end: 0 },
+      alpha: { start: 1, end: 0 }, tint, emitting: false,
+    }).setDepth(DEPTH.fx);
+    this.snowFx = fx(0xd4e4f3);
+    this.appleFx = fx(COLORS.apple);
+    this.goldFx = fx(0xffc300);
+
+    this.bubble = this.add.text(0, 0, '', {
+      fontFamily: FONT, fontSize: '18px', fontStyle: '800', color: COLORS.text,
+      backgroundColor: '#ffffff', padding: { x: 10, y: 6 }, align: 'center',
+    }).setOrigin(0.5, 1).setResolution(textRes(this)).setDepth(DEPTH.bubble).setVisible(false);
+    this.bubbleUntil = 0;
+
+    // HUD
+    const hud = o => o.setScrollFactor(0).setDepth(DEPTH.hud);
+    this.scoreText = hud(addText(this, 20, 26, '0', 30, COLORS.text, '900').setOrigin(0, 0.5));
+    this.distText = hud(addText(this, 20, 55, '0 m', 16, COLORS.dim, '700').setOrigin(0, 0.5));
+    hud(addText(this, 20, 76, DIFFICULTIES[this.difficultyKey].label, 12, COLORS.dim, '800').setOrigin(0, 0.5));
+    this.energyLabel = hud(addText(this, 250, 18, 'ENERGY', 12, COLORS.dim, '800').setOrigin(0, 0.5));
+    this.energyG = hud(this.add.graphics());
+    this.buttText = hud(addText(this, 450, 36, '', 18, COLORS.text, '800').setOrigin(0, 0.5));
+    this.wolfText = hud(addText(this, 450, 62, '', 16, '#4a4e69', '900').setOrigin(0, 0.5));
+    addMuteButton(this);
+
+    // Input
+    this.cursors = this.input.keyboard.createCursorKeys();
+    this.wasd = this.input.keyboard.addKeys('W,A,S,D');
+    this.input.keyboard.on('keydown-SPACE', () => this.jump());
+    this.input.keyboard.on('keydown', () => { this.usedKeyboard = true; });
+    this.input.keyboard.on('keydown-P', this.pause, this);
+    this.input.keyboard.on('keydown-ESC', this.pause, this);
+    if (this.sys.game.device.input.touch) this.makeTouchControls();
+
+    // Auto-pause when the tab or window loses focus
+    const onBlur = () => this.pause();
+    this.game.events.on(Phaser.Core.Events.BLUR, onBlur);
+    this.game.events.on(Phaser.Core.Events.HIDDEN, onBlur);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.game.events.off(Phaser.Core.Events.BLUR, onBlur);
+      this.game.events.off(Phaser.Core.Events.HIDDEN, onBlur);
+    });
+
+    this.time.delayedCall(400, () => this.say(pick(['Beautiful day for skiing!', 'Fresh powder!', 'Nothing could go wrong today.'])));
+  }
+
+  makeTouchControls() {
+    const hud = o => o.setScrollFactor(0).setDepth(DEPTH.hud);
+    this.btns = {
+      left:  { x: 85,          y: HEIGHT - 85, r: 60, label: '◀' },
+      right: { x: 225,         y: HEIGHT - 85, r: 60, label: '▶' },
+      jump:  { x: WIDTH - 95,  y: HEIGHT - 90, r: 66, label: 'JUMP' },
+    };
+    Object.values(this.btns).forEach(b => {
+      b.circle = hud(this.add.circle(b.x, b.y, b.r, 0x1d3557, 0.18));
+      hud(addText(this, b.x, b.y, b.label, b.label.length > 1 ? 22 : 34, COLORS.white, '900'));
+    });
+    const near = (p, b) => Phaser.Math.Distance.Between(p.x, p.y, b.x, b.y) < b.r + 18;
+    this.nearBtn = near;
+    this.input.on('pointerdown', p => {
+      if (near(p, this.btns.jump)) {
+        this.jump();
+        this.tweens.add({ targets: this.btns.jump.circle, scale: 0.88, duration: 70, yoyo: true });
+      }
+    });
+    const pauseBtn = hud(addText(this, WIDTH - 140, 24, 'II', 20, COLORS.dim, '900').setInteractive());
+    pauseBtn.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); this.pause(); });
+  }
+
+  difficulty() { return Math.min(1, this.elapsed / (TUNING.rampSeconds * 1000)); }
+  isAir() { return this.elapsed < this.sk.airUntil; }
+
+  readInput() {
+    const k = this.cursors, w = this.wasd;
+    const inp = {
+      left: k.left.isDown || w.A.isDown, right: k.right.isDown || w.D.isDown,
+      up: k.up.isDown || w.W.isDown, down: k.down.isDown || w.S.isDown, autoCenter: false,
+    };
+    if (this.btns) {
+      let tl = false, tr = false;
+      for (const p of this.input.manager.pointers) {
+        if (!p.isDown) continue;
+        if (this.nearBtn(p, this.btns.left)) tl = true;
+        if (this.nearBtn(p, this.btns.right)) tr = true;
+      }
+      this.btns.left.circle.setFillStyle(0x1d3557, tl ? 0.4 : 0.18);
+      this.btns.right.circle.setFillStyle(0x1d3557, tr ? 0.4 : 0.18);
+      inp.left = inp.left || tl; inp.right = inp.right || tr;
+      inp.autoCenter = !this.usedKeyboard;
+    }
+    return inp;
+  }
+
+  update(time, delta) {
+    if (this.over) return;
+    const dt = Math.min(delta, 50) / 1000;
+    this.elapsed += dt * 1000;
+    const s = this.sk, T = TUNING;
+    const inp = this.readInput();
+    const air = this.isAir();
+
+    // --- Skiing ---
+    if (s.state === 'ski') {
+      const turn = T.turnRate * dt * (air ? T.airControl : 1);
+      if (inp.left) s.heading -= turn;
+      if (inp.right) s.heading += turn;
+      if (!air && inp.down) s.heading = approach(s.heading, 0, T.tuckRate * dt);
+      else if (inp.autoCenter && !inp.left && !inp.right) s.heading = approach(s.heading, 0, T.touchCenterRate * dt);
+      s.heading = Phaser.Math.Clamp(s.heading, -T.maxHeading, T.maxHeading);
+
+      const boosting = this.elapsed < s.boostUntil;
+      const energyF = s.energy >= T.tiredThreshold ? 1 : lerp(T.tiredSpeedMin, 1, s.energy / T.tiredThreshold);
+      const target = T.maxSpeed * (0.35 + 0.65 * Math.cos(s.heading)) * energyF
+        * (1 + T.buttSpeedBonus * s.butt) * (boosting ? T.boostMult : 1) * (inp.down ? T.tuckBonus : 1);
+      if (!air && inp.up) s.speed = Math.max(0, s.speed - T.brakeDecel * dt);
+      else if (s.speed < target) s.speed = Math.min(target, s.speed + T.accel * dt * (boosting ? 2 : 1) * (inp.down ? 1.3 : 1));
+      else if (!air) s.speed = Math.max(target, s.speed - T.accel * 1.2 * dt);
+      if (!boosting) s.energy = Math.max(0, s.energy - T.energyDrainPerSec * dt);
+
+      if (boosting && Math.random() < 0.5) this.goldFx.emitParticleAt(s.x, s.y - 10, 1);
+      if (!air && s.speed > 220 && (Math.abs(s.heading) > 0.8 || inp.up)) this.snowFx.emitParticleAt(s.x, s.y + 4, 1);
+
+      if (s.energy < T.tiredThreshold && this.elapsed > this.nextHuffAt) {
+        this.nextHuffAt = this.elapsed + 1800;
+        if (!this.saidTired) { this.saidTired = true; this.say('So... tired... need a snack...'); }
+        else this.popText(s.x + 30, s.y - 50, pick(['huff', 'puff', '*pant*', 'so tired...']), COLORS.dim, 16);
+      }
+    } else if (s.state === 'crash') {
+      s.speed = 0;
+      if (this.elapsed >= s.crashUntil) {
+        s.state = 'ski';
+        s.invulnUntil = this.elapsed + T.invulnMs;
+        s.heading = Phaser.Math.Clamp(s.heading, -0.4, 0.4);
+      }
+    } else if (s.state === 'break') {
+      s.speed = Math.max(0, s.speed - 1100 * dt);
+    }
+
+    s.vy = Math.cos(s.heading) * s.speed;
+    s.x += Math.sin(s.heading) * s.speed * dt;
+    s.y += s.vy * dt;
+
+    const nowAir = this.isAir();
+    if (s.wasAir && !nowAir && s.state === 'ski') this.land();
+    s.wasAir = nowAir;
+
+    this.checkCollisions(nowAir);
+    this.updateWolves(dt);
+    if (this.over) return;
+
+    // --- Camera, world streaming ---
+    const cam = this.cameras.main;
+    cam.scrollY = s.y - HEIGHT * T.skierScreenY;
+    cam.scrollX += (s.x - WIDTH / 2 - cam.scrollX) * Math.min(1, dt * 5);
+    this.streamWorld(cam);
+
+    this.drawSkier(nowAir);
+    this.drawTrail(nowAir);
+    this.updateHud();
+  }
+
+  /* ---------- world ---------- */
+  streamWorld(cam) {
+    const T = TUNING, bottom = cam.scrollY + HEIGHT + 120, cx = cam.scrollX + WIDTH / 2;
+    while (this.nextRowY < bottom) {
+      this.spawnRow(this.nextRowY, cx);
+      this.nextRowY += lerp(T.rowSpacing[0], T.rowSpacing[1], this.difficulty()) * Phaser.Math.FloatBetween(0.7, 1.3);
+    }
+    if (this.nextAppleY < bottom) {
+      let x = this.sk.x + Phaser.Math.Between(-240, 240), tries = 0;
+      while (!this.clearAt(x, this.nextAppleY, 75) && ++tries < 12) x = this.sk.x + Phaser.Math.Between(-300, 300);
+      this.addObj('apple', x, this.nextAppleY);
+      this.nextAppleY += Phaser.Math.Between(T.appleEveryPx[0], T.appleEveryPx[1]);
+    }
+    const top = cam.scrollY - 120;
+    for (let i = this.objs.length - 1; i >= 0; i--) {
+      const o = this.objs[i];
+      if (o.y < top) {
+        o.sprites.forEach(sp => { this.tweens.killTweensOf(sp); sp.destroy(); });
+        this.objs.splice(i, 1);
+      }
+    }
+  }
+
+  clearAt(x, y, r) {
+    for (const o of this.objs) {
+      if (o.type === 'deco') continue;
+      if (Math.abs(o.y - y) < r && Math.abs(o.x - x) < r + (o.type === 'gate' ? 60 : 0)) return false;
+    }
+    return true;
+  }
+
+  spawnRow(y, cx) {
+    const T = TUNING, C = T.chance, d = this.difficulty();
+    const n = Phaser.Math.Between(2, 2 + Math.round(d * 2));
+    for (let i = 0; i < n; i++) {
+      const x = cx + Phaser.Math.Between(-T.spawnHalfWidth, T.spawnHalfWidth);
+      const yy = y + Phaser.Math.Between(-20, 20);
+      if (yy < T.clearStartPx + 100 && Math.abs(x) < 140) continue;       // clear start
+      if (!this.clearAt(x, yy, 48)) continue;
+      const r = Math.random();
+      let acc = 0;
+      if (r < (acc += C.ramp)) this.addObj('ramp', x, yy);
+      else if (r < (acc += C.gate)) { if (this.clearAt(x, yy, 90)) this.addObj('gate', x, yy); }
+      else if (r < (acc += C.rock)) this.addObj('rock', x, yy);
+      else if (r < (acc += C.stump)) this.addObj('stump', x, yy);
+      else if (r < (acc += C.forest)) {
+        for (let k = 0; k < Phaser.Math.Between(3, 5); k++) {
+          const fx = x + Phaser.Math.Between(-70, 70), fy = yy + Phaser.Math.Between(-40, 40);
+          if (this.clearAt(fx, fy, 26)) this.addObj('tree', fx, fy);
+        }
+      }
+      else this.addObj('tree', x, yy);
+    }
+    if (Math.random() < 0.7) this.addObj('deco', cx + Phaser.Math.Between(-T.spawnHalfWidth, T.spawnHalfWidth), y);
+  }
+
+  addObj(type, x, y) {
+    const o = { type, x, y, done: false, sprites: [], r: 0 };
+    const img = (key, ox, oy) => { const sp = this.add.image(x, y, key).setOrigin(ox, oy).setDepth(y); o.sprites.push(sp); return sp; };
+    switch (type) {
+      case 'tree':  img('tree', 0.5, 0.9).setScale(Phaser.Math.FloatBetween(0.9, 1.2)); break;
+      case 'rock':  img('rock', 0.5, 0.6); o.r = 16; break;
+      case 'stump': img('stump', 0.5, 0.6); o.r = 13; break;
+      case 'ramp':  img('ramp', 0.5, 0.5); break;
+      case 'deco':  img('bump', 0.5, 0.5).setDepth(DEPTH.deco).setScale(Phaser.Math.FloatBetween(0.7, 1.4)); break;
+      case 'apple': {
+        const sp = img('apple', 0.5, 0.7);
+        const glow = img('appleGlow', 0.5, 0.5).setDepth(y - 1).setY(y - 12);
+        this.tweens.add({ targets: sp, scale: 1.12, duration: 450, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
+        this.tweens.add({ targets: glow, scale: 1.25, alpha: 0.6, duration: 450, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
+        break;
+      }
+      case 'gate': {
+        o.half = 52;
+        img('flagR', 0.1, 0.95).setX(x - 55);
+        img('flagB', 0.1, 0.95).setX(x + 55);
+        break;
+      }
+    }
+    this.objs.push(o);
+    return o;
+  }
+
+  checkCollisions(air) {
+    const s = this.sk, T = TUNING;
+    const h = this.airHeight();
+    for (const o of this.objs) {
+      if (o.done || o.type === 'deco') continue;
+      const dx = s.x - o.x, dy = s.y - o.y;
+      if (Math.abs(dy) > 60 || Math.abs(dx) > 90) continue;
+      if (o.type === 'gate') {
+        if (dy >= 0 && dy < 40) {
+          o.done = true;
+          if (Math.abs(dx) < o.half) { Sfx.play('gate'); this.addBonus(T.pts.gate, 'GATE +' + T.pts.gate, o.x, o.y - 30); }
+        }
+        continue;
+      }
+      if (s.state !== 'ski') return;
+      const invuln = this.elapsed < s.invulnUntil;
+      switch (o.type) {
+        case 'tree':
+          if (!invuln && !(s.rampAir && h > 25) && Math.abs(dx) < 13 && dy > -10 && dy < 8) return this.crash(o, dx);
+          break;
+        case 'rock': case 'stump':
+          if (dx * dx + dy * dy < o.r * o.r) {
+            if (air) { o.done = true; Sfx.play('bonus'); this.addBonus(T.pts.jumpOver, 'NICE +' + T.pts.jumpOver, o.x, o.y - 30); }
+            else if (!invuln) return this.crash(o, dx);
+          }
+          break;
+        case 'ramp':
+          if (!air && Math.abs(dx) < 32 && Math.abs(dy) < 14) { o.done = true; this.jump(true); }
+          break;
+        case 'apple':
+          if (dx * dx + dy * dy < T.appleRadius * T.appleRadius) return this.eatApple(o);   // even mid-jump
+          break;
+      }
+    }
+  }
+
+  /* ---------- skier actions ---------- */
+  airHeight() {
+    const s = this.sk;
+    if (!this.isAir()) return 0;
+    const t = (this.elapsed - s.airStart) / s.airDur;
+    return Math.sin(Math.PI * t) * (s.rampAir ? TUNING.rampJumpHeight : TUNING.jumpHeight);
+  }
+
+  jump(ramp = false) {
+    const s = this.sk, T = TUNING;
+    if (this.over || s.state !== 'ski') return;
+    if (!ramp && (this.isAir() || this.elapsed < s.jumpReadyAt)) return;
+    s.airStart = this.elapsed;
+    s.airDur = ramp ? T.rampJumpMs : T.jumpMs;
+    s.airUntil = this.elapsed + s.airDur;
+    s.rampAir = ramp;
+    if (ramp) {
+      Sfx.play('ramp');
+      s.speed = Math.max(s.speed, T.maxSpeed * 0.9);
+      this.addBonus(T.pts.ramp, 'BIG AIR +' + T.pts.ramp, s.x, s.y - 60);
+    } else {
+      Sfx.play('jump');
+      s.energy = Math.max(0, s.energy - T.jumpEnergyCost);
+    }
+    this.snowFx.explode(6, s.x, s.y + 4);
+  }
+
+  land() {
+    const s = this.sk;
+    s.jumpReadyAt = this.elapsed + TUNING.jumpCooldownMs;
+    Sfx.play('land');
+    this.snowFx.explode(s.rampAir ? 14 : 7, s.x, s.y + 4);
+    this.tweens.add({ targets: this.skBody, scaleX: 1.15, scaleY: 0.82, duration: 70, yoyo: true });
+    if (s.rampAir) this.cameras.main.shake(90, 0.004);
+    s.rampAir = false;
+  }
+
+  crash(o, dx) {
+    const s = this.sk, T = TUNING;
+    s.state = 'crash';
+    s.crashUntil = this.elapsed + T.crashMs;
+    s.crashDir = dx >= 0 ? 1 : -1;
+    s.speed = 0;
+    s.airUntil = -1; s.wasAir = false; s.rampAir = false;
+    s.energy = Math.max(0, s.energy - T.crashEnergyCost);
+    Sfx.play('crash');
+    this.cameras.main.shake(200, 0.01);
+    this.snowFx.explode(18, s.x, s.y - 10);
+    this.popText(s.x, s.y - 60, pick(['OOF!', 'OUCH!', 'WHOOPS!', 'BONK!']), COLORS.accent, 24);
+    if (o.type === 'tree') {
+      const sp = o.sprites[0];
+      this.tweens.add({ targets: sp, angle: { from: -5, to: 5 }, duration: 60, yoyo: true, repeat: 2,
+        onComplete: () => sp.setAngle(0) });
+      this.snowFx.explode(10, o.x, o.y - 60);
+    }
+  }
+
+  eatApple(o) {
+    const s = this.sk, T = TUNING;
+    o.done = true;
+    o.sprites.forEach(sp => {
+      this.tweens.killTweensOf(sp);
+      this.tweens.add({ targets: sp, scale: 0, duration: 220, onComplete: () => sp.setVisible(false) });
+    });
+    s.state = 'break';
+    s.airUntil = -1;
+    this.apples++;
+    this.addBonus(T.pts.apple, '', 0, 0);
+    this.say(pick(['Ooh, an apple! Break time.', 'Snack break!', 'Mmm... apple.']));
+    this.tweens.add({ targets: this.skBody, y: 6, scaleY: 0.85, duration: 180 });
+
+    const at = (ms, fn) => this.time.delayedCall(ms, () => { if (!this.over) fn(); });
+    [150, 420, 700].forEach(ms => at(ms, () => {
+      Sfx.play('crunch', Phaser.Math.FloatBetween(0.85, 1.2));
+      this.appleFx.explode(5, s.x, s.y - 30);
+    }));
+    at(T.breakEatMs, () => {
+      this.tweens.addCounter({ from: s.energy, to: 100, duration: 300, onUpdate: tw => { s.energy = tw.getValue(); } });
+      this.say(pick(['...hold on.', '...wait a second.', '...hmm.']));
+    });
+    at(T.breakEatMs + T.breakRealizeMs, () => {
+      s.butt = Math.min(T.buttMax, s.butt + 1);
+      Sfx.play('boing'); at(160, () => Sfx.play('boing', 1.3));
+      this.tweens.add({ targets: this.buttImg, scale: buttScale(s.butt), duration: 700, ease: 'Elastic.Out' });
+      this.cameras.main.shake(160, 0.006);
+      this.say(pick(['MY BUTT IS HUGE!', 'WHOA. BIG BUTT.', 'THAT BUTT IS ENORMOUS!', 'IS THAT MY BUTT?!']), true);
+      this.tweens.add({ targets: this.buttText, scale: 1.5, duration: 120, yoyo: true });
+    });
+    at(T.breakEatMs + T.breakRealizeMs + T.breakGoMs, () => {
+      s.state = 'ski';
+      s.heading = 0;
+      s.speed = T.maxSpeed * 0.8;
+      s.boostUntil = this.elapsed + T.boostMs;
+      s.invulnUntil = this.elapsed + 500;
+      this.tweens.add({ targets: this.skBody, y: 0, scaleY: 1, duration: 150 });
+      Sfx.play('whoosh');
+      this.goldFx.explode(16, s.x, s.y - 10);
+      this.say(pick(['Gotta burn this off!', 'CARDIO TIME!', 'Must... ski... faster!', 'Never again. (Until the next apple.)']));
+    });
+  }
+
+  /* ---------- dire wolves ---------- */
+  updateWolves(dt) {
+    const s = this.sk, T = TUNING;
+    if (!this.wolvesActive) {
+      if (this.elapsed < T.wolfArriveMs) return;
+      this.wolvesActive = true;
+      this.wolfStart = this.elapsed;
+      this.gap = T.wolfStartGap;
+      this.wolves.forEach(w => { w.wx = s.x + w.ox; });
+      Sfx.play('howlUp'); this.time.delayedCall(650, () => Sfx.play('howlDn'));
+      this.banner('DIRE WOLVES!', 'They smell fear. And apples. Keep moving!');
+    }
+    const d = (this.elapsed - this.wolfStart) / (T.wolfRampSeconds * 1000);
+    this.wolfSpeed = lerp(T.wolfSpeed[0], T.wolfSpeed[1], d) * DIFFICULTIES[this.difficultyKey].wolfSpeedMult;
+    this.gap = Math.min(T.wolfMaxGap, this.gap + (s.vy - this.wolfSpeed) * dt);
+    if (this.gap <= T.wolfCatchGap) return this.caught();
+
+    if (this.gap < 260 && this.elapsed > this.nextGrowlAt) {
+      this.nextGrowlAt = this.elapsed + 4000;
+      Sfx.play('growl');
+    }
+    const close = Phaser.Math.Clamp(this.gap / 200, 0, 1);
+    this.wolves.forEach(w => {
+      const tx = s.x + w.ox * (0.35 + 0.65 * close);
+      const vx = (tx - w.wx) * Math.min(1, dt * 2.5);
+      w.wx += vx;
+      const wy = s.y - this.gap - w.oy * close + Math.sin((this.elapsed + w.phase) / 90) * 2;
+      w.setPosition(w.wx, wy).setDepth(wy).setVisible(true);
+      w.setTexture(Math.floor((this.elapsed + w.phase) / 110) % 2 ? 'wolf1' : 'wolf0');
+      w.rotation = Phaser.Math.Clamp(-vx / Math.max(dt, 0.001) * 0.004, -0.5, 0.5);
+    });
+  }
+
+  caught() {
+    const s = this.sk;
+    this.over = true;
+    s.state = 'caught';
+    Sfx.play('growl'); Sfx.play('crash');
+    this.cameras.main.shake(400, 0.015);
+    this.cameras.main.flash(180, 120, 20, 20);
+    this.say(pick(['NOT THE BUTT!', 'GOOD DOGGIES?!', 'I REGRET NOTHING!']), true);
+    this.bubble.setPosition(s.x, s.y - 80);
+    this.wolves.forEach((w, i) => {
+      this.tweens.add({ targets: w, x: s.x + (i - 1.5) * 14, y: s.y - 10 + (i % 2) * 12, duration: 220 + i * 60, ease: 'Quad.In' });
+    });
+    this.tweens.add({ targets: [this.skier, this.shadow], scale: 0, angle: 200, duration: 500, delay: 250, ease: 'Back.In' });
+    this.snowFx.explode(30, s.x, s.y);
+    this.time.delayedCall(1600, () => this.scene.start('GameOver', {
+      score: this.score(), meters: this.meters(), apples: this.apples, butt: s.butt, difficulty: this.difficultyKey,
+    }));
+  }
+
+  /* ---------- drawing ---------- */
+  drawSkier(air) {
+    const s = this.sk, h = this.airHeight();
+    this.skier.setPosition(s.x, s.y - h).setScale(1 + h / 140).setDepth(s.y + 1);
+    this.shadow.setPosition(s.x, s.y + 2).setScale(1 - h / 150).setDepth(s.y - 0.5);
+    if (s.state === 'ski') {
+      this.skis.rotation = -s.heading;
+      this.skBody.rotation = -s.heading * 0.35;
+      this.skier.rotation = s.rampAir && air ? ((this.elapsed - s.airStart) / s.airDur) * Math.PI * 2 : 0;
+    } else if (s.state === 'crash') {
+      this.skier.rotation = s.crashDir * 1.4;
+    } else if (s.state === 'break') {
+      this.skis.rotation = Math.PI / 2;
+      this.skBody.rotation = 0;
+      this.skier.rotation = 0;
+    }
+    const blink = s.state === 'ski' && this.elapsed < s.invulnUntil && Math.floor(this.elapsed / 80) % 2;
+    this.skier.setAlpha(blink ? 0.4 : 1);
+    if (this.elapsed < this.bubbleUntil) this.bubble.setPosition(s.x, s.y - 62 - h);
+    else if (this.bubble.visible) this.bubble.setVisible(false);
+  }
+
+  drawTrail(air) {
+    const s = this.sk, tr = this.trail, last = tr[tr.length - 1];
+    if (s.state === 'ski' && !air) {
+      if (!last || Phaser.Math.Distance.Between(last.x, last.y, s.x, s.y) > 10) tr.push({ x: s.x, y: s.y, h: s.heading });
+    } else if (last) tr.push(null);
+    while (tr.length > 100) tr.shift();
+    const g = this.trailG;
+    g.clear().lineStyle(3, COLORS.track, 1);
+    for (let i = 1; i < tr.length; i++) {
+      const a = tr[i - 1], b = tr[i];
+      if (!a || !b) continue;
+      for (const side of [-5, 5]) {
+        const ax = a.x + Math.cos(a.h) * side, ay = a.y - Math.sin(a.h) * side;
+        const bx = b.x + Math.cos(b.h) * side, by = b.y - Math.sin(b.h) * side;
+        g.lineBetween(ax, ay, bx, by);
+      }
+    }
+  }
+
+  meters() { return Math.max(0, Math.floor(this.sk.y / TUNING.pxPerMeter)); }
+  score() { return this.meters() + this.bonus; }
+
+  updateHud() {
+    const s = this.sk, T = TUNING, sc = this.score();
+    if (sc !== this.shownScore) { this.shownScore = sc; this.scoreText.setText(sc); }
+    this.distText.setText(this.meters() + ' m');
+
+    const g = this.energyG, x = 250, y = 28, w = 180, hh = 14, e = s.energy / 100;
+    const tired = s.energy < T.tiredThreshold;
+    const col = e > 0.6 ? 0x52b788 : !tired ? 0xffb703 : 0xe63946;
+    g.clear().fillStyle(0x1d2433, 0.12).fillRoundedRect(x, y, w, hh, 7);
+    if (e > 0.02) g.fillStyle(col).fillRoundedRect(x, y, Math.max(hh, w * e), hh, 7);
+    this.energyLabel.setText(tired ? 'TIRED... FIND AN APPLE' : this.elapsed < s.boostUntil ? 'BUTT-POWERED BOOST!' : 'ENERGY')
+      .setColor(tired ? COLORS.accent : this.elapsed < s.boostUntil ? COLORS.gold : COLORS.dim);
+
+    this.buttText.setText(s.butt > 0 ? 'BUTT SIZE ' + (s.butt + 1) : '');
+
+    if (!this.wolvesActive) { this.wolfText.setText(''); return; }
+    const onScreen = this.gap < HEIGHT * T.skierScreenY - 10;
+    const m = Math.max(0, Math.round(this.gap / T.pxPerMeter));
+    this.wolfText.setText(onScreen ? '' : 'WOLVES ' + m + ' m BEHIND')
+      .setColor(this.gap < 400 ? COLORS.accent : '#4a4e69')
+      .setAlpha(this.gap < 400 ? 0.6 + 0.4 * Math.abs(Math.sin(this.elapsed / 150)) : 1);
+  }
+
+  /* ---------- UI bits ---------- */
+  say(str, big = false) {
+    this.bubble.setText(str).setFontSize(big ? 24 : 18).setColor(big ? COLORS.accent : COLORS.text).setVisible(true);
+    this.bubbleUntil = this.elapsed + (big ? 1300 : 1700);
+    this.bubble.setPosition(this.sk.x, this.sk.y - 62);
+    this.bubble.setScale(0.3);
+    this.tweens.add({ targets: this.bubble, scale: 1, duration: 220, ease: 'Back.Out' });
+  }
+
+  popText(x, y, str, color = COLORS.gold, size = 22) {
+    const t = addText(this, x, y, str, size, color, '900').setDepth(DEPTH.pop);
+    this.tweens.add({ targets: t, y: y - 40, alpha: 0, duration: 800, ease: 'Cubic.Out', onComplete: () => t.destroy() });
+  }
+
+  addBonus(pts, label, x, y) {
+    this.bonus += pts;
+    if (label) this.popText(x, y, label);
+    this.tweens.add({ targets: this.scoreText, scale: 1.3, duration: 90, yoyo: true });
+  }
+
+  banner(title, sub) {
+    const t1 = addText(this, WIDTH / 2, HEIGHT * 0.45, title, 44, COLORS.accent, '900').setScrollFactor(0).setDepth(DEPTH.hud).setScale(0);
+    const t2 = addText(this, WIDTH / 2, HEIGHT * 0.45 + 44, sub, 18, COLORS.text, '700').setScrollFactor(0).setDepth(DEPTH.hud).setAlpha(0);
+    this.tweens.add({ targets: t1, scale: 1, duration: 400, ease: 'Back.Out' });
+    this.tweens.add({ targets: t2, alpha: 1, duration: 300, delay: 200 });
+    this.tweens.add({ targets: [t1, t2], alpha: 0, duration: 500, delay: 2200, onComplete: () => { t1.destroy(); t2.destroy(); } });
+  }
+
+  pause() {
+    if (this.over || !this.scene.isActive()) return;
+    this.scene.launch('Pause');
+    this.scene.pause();
+  }
+}
+
+class PauseScene extends Phaser.Scene {
+  constructor() { super('Pause'); }
+  create() {
+    this.add.rectangle(0, 0, WIDTH, HEIGHT, 0x1d2433, 0.6).setOrigin(0);
+    addText(this, WIDTH / 2, HEIGHT / 2 - 20, 'PAUSED', 56, COLORS.white, '900');
+    addText(this, WIDTH / 2, HEIGHT / 2 + 40, 'Tap or press P to resume', 22, '#dde7f0');
+    const resume = () => { this.scene.resume('Game'); this.scene.stop(); };
+    this.time.delayedCall(150, () => {
+      this.input.keyboard.once('keydown-P', resume);
+      this.input.keyboard.once('keydown-ESC', resume);
+      this.input.keyboard.once('keydown-SPACE', resume);
+      this.input.once('pointerdown', resume);
+    });
+  }
+}
+
+class GameOverScene extends Phaser.Scene {
+  constructor() { super('GameOver'); }
+  init(data) { this.data_ = data || {}; }
+  create() {
+    const d = this.data_, score = d.score || 0;
+    this.cameras.main.setBackgroundColor(COLORS.snow);
+    const diff = DIFFICULTIES[d.difficulty] ? d.difficulty : 'normal';
+    const prevBest = getBest(diff);
+    const isBest = score > prevBest;
+    if (isBest) Store.set('best_' + diff, score);
+
+    this.add.image(WIDTH / 2 - 270, HEIGHT * 0.2, 'wolf0').setScale(1.4).setAngle(-20);
+    this.add.image(WIDTH / 2 + 270, HEIGHT * 0.2, 'wolf1').setScale(1.4).setAngle(20);
+    addText(this, WIDTH / 2, HEIGHT * 0.2, 'THE DIRE WOLVES\nGOT YOU', 42, COLORS.text, '900');
+    const scoreT = addText(this, WIDTH / 2, HEIGHT * 0.43, String(score), 76, COLORS.accent, '900').setScale(0);
+    this.tweens.add({ targets: scoreT, scale: 1, duration: 400, ease: 'Back.Out' });
+    const buttLine = d.butt ? ' · butt size ' + (d.butt + 1) : '';
+    addText(this, WIDTH / 2, HEIGHT * 0.53, (d.meters || 0) + ' m · ' + (d.apples || 0) + (d.apples === 1 ? ' apple' : ' apples') + buttLine, 20, COLORS.dim, '700');
+    addText(this, WIDTH / 2, HEIGHT * 0.6,
+      (isBest ? '★ New ' + DIFFICULTIES[diff].label + ' best! ★' : DIFFICULTIES[diff].label + ' best: ' + Math.max(prevBest, score)), 22, isBest ? COLORS.gold : COLORS.dim, '800');
+    const prompt = addText(this, WIDTH / 2, HEIGHT * 0.74, 'Press SPACE or tap to ski again', 24, COLORS.text, '800');
+    this.tweens.add({ targets: prompt, alpha: 0.3, duration: 700, yoyo: true, repeat: -1 });
+    addText(this, WIDTH / 2, HEIGHT * 0.81, 'ESC: change difficulty', 16, COLORS.dim, '700');
+    Sfx.play('over');
+    addMuteButton(this);
+
+    this.time.delayedCall(400, () => {
+      const again = () => { Sfx.play('start'); this.scene.start('Game', { difficulty: diff }); };
+      this.input.keyboard.once('keydown-ESC', () => this.scene.start('Title'));
+      this.input.keyboard.once('keydown-SPACE', again);
+      this.input.keyboard.once('keydown-ENTER', again);
+      this.input.once('pointerdown', again);
+    });
+  }
+}
+
+/* =====================================================================
+   5. BOOT
+   ===================================================================== */
+window.game = new Phaser.Game({
+  type: Phaser.AUTO,
+  parent: 'game',
+  width: WIDTH,
+  height: HEIGHT,
+  backgroundColor: '#f3f7fb',
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+  input: { activePointers: 3 },
+  scene: [BootScene, TitleScene, GameScene, PauseScene, GameOverScene],
+});
+</script>
+</body>
+</html>
