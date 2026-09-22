@@ -4,24 +4,42 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Ski Simulator</title>
+<meta name="theme-color" content="#f3f7fb">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Ski Sim">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
 <style>
-  html, body { margin: 0; height: 100%; background: #c9d6e3; overflow: hidden;
-    touch-action: none; user-select: none; -webkit-user-select: none; }
-  #game { width: 100vw; height: 100vh; height: 100dvh; }
+  html, body { margin: 0; height: 100%; background: #f3f7fb; overflow: hidden; overscroll-behavior: none;
+    touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent; }
+  #game { position: fixed; inset: 0; }
   canvas { display: block; }
+  /* Invisible probe used to read the phone's notch / home-bar safe areas */
+  #safe { position: fixed; top: 0; left: 0; visibility: hidden; pointer-events: none;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/phaser@3.90.0/dist/phaser.min.js"></script>
 </head>
 <body>
 <div id="game"></div>
+<div id="safe"></div>
 <script>
 'use strict';
 /* =====================================================================
    1. CONFIG & TUNING — every tweakable number lives here
    ===================================================================== */
 const GAME_ID = 'ski-simulator';
-const WIDTH = 800, HEIGHT = 600;
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+// Responsive layout: every screen shows the same VIEW_H world units top-to-bottom, so everyone
+// sees the same distance down the slope. Only the side-to-side view changes with screen shape.
+const VIEW_H = 840;
+const MENU_W = 440, MENU_H = 720;   // title / game-over / pause are laid out in this box, scaled to fit
+const TEX_RES = 2;                  // all art is drawn at 2× detail so it stays sharp on phones
 
 const COLORS = {
   snow: 0xf3f7fb, snowShade: 0xdde7f0, track: 0xcfdbe7,
@@ -29,13 +47,14 @@ const COLORS = {
   tree: 0x40916c, treeDark: 0x1b4332, trunk: 0x7f5539, rock: 0x9aa5b8, rockDark: 0x5c677d,
   apple: 0xe5383b, leaf: 0x52b788, wolf: 0x5a5a72, wolfDark: 0x2b2b3d, eye: 0xff3b3b,
   ramp: 0xa9def9, rampDark: 0x5fa8d3, flagRed: 0xe63946, flagBlue: 0x3a86ff,
+  icon: 0x5c677d, ink: 0x1d2433,
   text: '#1d2433', dim: '#5c677d', accent: '#e63946', gold: '#e09f00', white: '#ffffff',
 };
 
-const DEPTH = { deco: -20, trail: -10, fx: 1e8, pop: 1e8 + 5, bubble: 1e8 + 10, hud: 1e9 };
+const DEPTH = { deco: -20, trail: -10, fx: 1e8, pop: 1e8 + 5, bubble: 1e8 + 10 };
 
 const TUNING = {
-  skierScreenY: 0.3,        // skier sits this far down the screen
+  skierScreenY: 0.3,        // skier sits this far down the screen; the rest is the slope ahead
   pxPerMeter: 10,
   // skiing
   maxSpeed: 430,            // px/s straight downhill with full energy
@@ -47,6 +66,7 @@ const TUNING = {
   touchCenterRate: 2.2,     // touch only: auto-straighten when not steering
   maxHeading: 1.35,         // rad (~77°)
   airControl: 0.4,
+  swipeJumpPx: 30,          // touch: upward swipe distance (UI units) that triggers a jump
   // jumping
   jumpMs: 650, jumpHeight: 30, jumpCooldownMs: 150, jumpEnergyCost: 3,
   rampJumpMs: 1150, rampJumpHeight: 70,
@@ -67,6 +87,7 @@ const TUNING = {
   clearStartPx: 380, firstApplePx: 2600,
   rowSpacing: [95, 58],     // px between obstacle rows [start, hardest]
   appleEveryPx: [3000, 4200],
+  appleSpread: 150,         // apples spawn within this many px of the skier's line (fits a phone's view)
   spawnHalfWidth: 950,
   rampSeconds: 120,         // time to reach full difficulty
   chance: { ramp: 0.06, gate: 0.05, rock: 0.24, stump: 0.1, forest: 0.08 },
@@ -81,11 +102,56 @@ const DIFFICULTIES = {
   hard:   { label: 'HARD',   blurb: 'Hungrier wolves', wolfSpeedMult: 1.1 },
 };
 const DIFF_KEYS = Object.keys(DIFFICULTIES);
-const getBest = diff => Store.get('best_' + diff, diff === 'normal' ? Store.get('best', 0) : 0);
 
 /* =====================================================================
-   2. HELPERS — storage and synthesized sound effects
+   2. HELPERS — screen sizing, storage, sound, shared UI
    ===================================================================== */
+const View = {
+  // Canvas is sized in device pixels (DPR capped at 2) so everything renders crisply.
+  compute() {
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssW = Math.max(1, window.innerWidth), cssH = Math.max(1, window.innerHeight);
+    this.w = Math.round(cssW * this.dpr);
+    this.h = Math.round(cssH * this.dpr);
+    this.worldZoom = this.h / VIEW_H;
+    // HUD scale: roughly constant physical size, a bit larger on big screens
+    const uiCss = Phaser.Math.Clamp(Math.min(cssW / 420, cssH / 640), 0.75, 1.5);
+    this.uiZoom = uiCss * this.dpr;
+    this.uw = this.w / this.uiZoom;
+    this.uh = this.h / this.uiZoom;
+    this.menuZoom = Math.min(this.w / MENU_W, this.h / MENU_H);
+    this.textRes = Phaser.Math.Clamp(Math.ceil(Math.max(this.menuZoom, this.uiZoom, this.worldZoom)), 1, 3);
+    const cs = getComputedStyle(document.getElementById('safe'));
+    const inset = side => (parseFloat(cs['padding' + side]) || 0) / uiCss;   // CSS px → HUD units
+    this.safe = { top: inset('Top'), right: inset('Right'), bottom: inset('Bottom'), left: inset('Left') };
+  },
+};
+View.compute();
+
+function applyView() {
+  const before = View.w + 'x' + View.h + '@' + View.dpr;
+  View.compute();
+  if (!window.game || !game.scale) return;
+  if (before !== View.w + 'x' + View.h + '@' + View.dpr) {
+    game.scale.resize(View.w, View.h);
+    game.scale.setZoom(1 / View.dpr);
+  }
+  game.events.emit('viewchange');
+}
+let resizeTimer = 0;
+const queueView = () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(applyView, 100); };
+window.addEventListener('resize', queueView);
+window.addEventListener('orientationchange', queueView);
+
+// Scenes call this to re-layout when the screen size/orientation changes; auto-removed on shutdown
+function onViewChange(scene, fn) {
+  scene.game.events.on('viewchange', fn);
+  scene.events.once(Phaser.Scenes.Events.SHUTDOWN, () => scene.game.events.off('viewchange', fn));
+}
+function fitMenuCamera(scene) {
+  scene.cameras.main.setZoom(View.menuZoom).centerOn(MENU_W / 2, MENU_H / 2);
+}
+
 const Store = {
   get(key, fallback) {
     try { const v = localStorage.getItem(GAME_ID + ':' + key);
@@ -96,6 +162,7 @@ const Store = {
     try { localStorage.setItem(GAME_ID + ':' + key, JSON.stringify(value)); } catch (e) {}
   },
 };
+const getBest = diff => Store.get('best_' + diff, diff === 'normal' ? Store.get('best', 0) : 0);
 
 const Sfx = {
   ctx: null,
@@ -161,31 +228,84 @@ const BUTT_RES = 4;
 const buttScale = lvl => (TUNING.buttBase + TUNING.buttGrow * lvl) / BUTT_RES;
 
 // Hi-DPI text only under WebGL; the Canvas renderer draws resolution>1 text at double size
-const textRes = scene => scene.sys.game.renderer.type === Phaser.WEBGL ? 2 : 1;
+const textRes = scene => scene.sys.game.renderer.type === Phaser.WEBGL ? View.textRes : 1;
 
 function addText(scene, x, y, str, size = 24, color = COLORS.text, weight = '600') {
   return scene.add.text(x, y, str, {
     fontFamily: FONT, fontSize: size + 'px', fontStyle: weight, color, align: 'center',
   }).setOrigin(0.5).setResolution(textRes(scene));
 }
+// Shrink a text object so it never exceeds maxW (keeps long lines on narrow screens)
+function fitText(t, maxW) { t.setScale(Math.min(1, maxW / Math.max(1, t.width))); return t; }
 
-function addMuteButton(scene) {
-  const label = m => m ? '♪ MUTED' : '♪ SOUND';
-  const btn = addText(scene, WIDTH - 16, 24, label(Sfx.muted), 15, COLORS.dim, '800').setOrigin(1, 0.5)
-    .setInteractive({ useHandCursor: true }).setDepth(DEPTH.hud).setScrollFactor(0);
-  const toggle = () => { btn.setText(label(Sfx.toggleMute())); };
-  btn.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); toggle(); });
-  scene.input.keyboard.on('keydown-M', toggle);
-  return btn;
-}
+// All textures are TEX_RES× size; sprite() places one at normal world size
+function sprite(scene, x, y, key, scale = 1) { return scene.add.image(x, y, key).setScale(scale / TEX_RES); }
 
 /* The skier is a container so his butt can grow independently */
 function makeSkier(scene, x, y) {
   const butt = scene.add.image(0, -12, 'butt').setScale(buttScale(0));
-  const skis = scene.add.image(0, 0, 'skis');
-  const body = scene.add.image(0, 0, 'skierBody').setOrigin(0.5, 0.94);
+  const skis = sprite(scene, 0, 0, 'skis');
+  const body = sprite(scene, 0, 0, 'skierBody').setOrigin(0.5, 0.94);
   const c = scene.add.container(x, y, [butt, skis, body]);   // butt behind skis so a huge one doesn't hide them
   return { c, skis, butt, body };
+}
+
+/* Vector icon buttons (sound, pause, fullscreen) — Graphics stay crisp at any zoom */
+const ICONS = {
+  sound(g, muted) {
+    g.fillStyle(0xffffff, 0.7).fillCircle(0, 0, 17);
+    g.fillStyle(COLORS.icon).fillRect(-9, -3, 4, 6)
+      .fillPoints([{ x: -5, y: -3 }, { x: 1, y: -8 }, { x: 1, y: 8 }, { x: -5, y: 3 }], true);
+    if (muted) g.lineStyle(2.5, COLORS.jacket).lineBetween(4, -5, 11, 5).lineBetween(11, -5, 4, 5);
+    else {
+      g.lineStyle(2, COLORS.icon).beginPath().arc(2, 0, 5, -0.9, 0.9).strokePath();
+      g.beginPath().arc(2, 0, 9, -0.9, 0.9).strokePath();
+    }
+  },
+  pause(g) {
+    g.fillStyle(0xffffff, 0.7).fillCircle(0, 0, 17);
+    g.fillStyle(COLORS.icon).fillRect(-6, -7, 4, 14).fillRect(2, -7, 4, 14);
+  },
+  fullscreen(g, on) {
+    g.fillStyle(0xffffff, 0.7).fillCircle(0, 0, 17);
+    g.lineStyle(2.5, COLORS.icon);
+    const a = on ? 3 : 8, b = on ? 8 : 3;   // corners point out (enter) or in (exit)
+    [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([sx, sy]) =>
+      g.strokePoints([{ x: sx * a, y: sy * b }, { x: sx * a, y: sy * a }, { x: sx * b, y: sy * a }]));
+  },
+};
+
+function iconButton(scene, draw, onTap) {
+  const g = scene.add.graphics();
+  const zone = scene.add.zone(0, 0, 44, 44).setInteractive({ useHandCursor: true });
+  // pointerdown is swallowed so it never counts as a start tap or steering;
+  // the action fires on pointerup because browsers only allow fullscreen from a tap's release
+  zone.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); });
+  zone.on('pointerup', (p, lx, ly, e) => { e && e.stopPropagation(); onTap(); });
+  const btn = {
+    g, zone, redraw() { g.clear(); draw(g); return btn; },
+    setPosition(x, y) { g.setPosition(x, y); zone.setPosition(x, y); return btn; },
+    setDepth(d) { g.setDepth(d); zone.setDepth(d); return btn; },
+  };
+  return btn.redraw();
+}
+
+// Sound / pause / fullscreen cluster, laid out right-to-left from (rightX, y)
+function addCornerButtons(scene, opts = {}) {
+  const btns = [];
+  const sound = iconButton(scene, g => ICONS.sound(g, Sfx.muted), () => { Sfx.toggleMute(); sound.redraw(); });
+  btns.push(sound);
+  scene.input.keyboard.on('keydown-M', () => { Sfx.toggleMute(); sound.redraw(); });
+  if (opts.pause) btns.push(iconButton(scene, ICONS.pause, opts.pause));
+  if (scene.sys.game.device.fullscreen.available) {
+    btns.push(iconButton(scene, g => ICONS.fullscreen(g, scene.scale.isFullscreen), () => {
+      if (scene.scale.isFullscreen) scene.scale.stopFullscreen(); else scene.scale.startFullscreen();
+    }));
+  }
+  return {
+    layout(rightX, y) { btns.forEach((b, i) => b.setPosition(rightX - 17 - i * 42, y).redraw()); },
+    setDepth(d) { btns.forEach(b => b.setDepth(d)); },
+  };
 }
 
 /* =====================================================================
@@ -193,7 +313,9 @@ function makeSkier(scene, x, y) {
    ===================================================================== */
 function makeTextures(scene) {
   const g = scene.make.graphics({ x: 0, y: 0 }, false);
-  const tex = (key, w, h, draw) => { g.clear(); draw(g); g.generateTexture(key, w, h); };
+  const tex = (key, w, h, draw, res = TEX_RES) => {
+    g.clear().setScale(res); draw(g); g.generateTexture(key, Math.ceil(w * res), Math.ceil(h * res));
+  };
 
   tex('skis', 24, 46, g => {
     g.fillStyle(COLORS.ski).fillRoundedRect(4, 2, 5, 42, 2).fillRoundedRect(15, 2, 5, 42, 2);
@@ -219,7 +341,7 @@ function makeTextures(scene) {
     g.fillStyle(0x4a6db3).fillEllipse(10 * k, 8 * k, 11 * k, 7 * k).fillEllipse(24 * k, 8 * k, 11 * k, 7 * k);
     g.fillStyle(0xffffff, 0.3).fillEllipse(8 * k, 6.5 * k, 4.5 * k, 2.5 * k).fillEllipse(22 * k, 6.5 * k, 4.5 * k, 2.5 * k);
     g.lineStyle(0.8 * k, 0x1f3563, 0.7).lineBetween(18 * k, 5 * k, 18 * k, 20 * k);                     // seam
-  });
+  }, 1);
   tex('shadow', 34, 12, g => { g.fillStyle(0x000000, 0.18).fillEllipse(17, 6, 34, 12); });
 
   tex('tree', 56, 80, g => {
@@ -303,35 +425,45 @@ class BootScene extends Phaser.Scene {
   create() { makeTextures(this); this.scene.start('Title'); }
 }
 
+// Decorative trees for menus: a few inside the layout box, the rest fill wide or tall screens
+const MENU_TREES = [[45, 290], [400, 250], [-70, 130], [-190, 360], [-90, 580], [-330, 200], [-420, 500],
+  [520, 150], [640, 400], [510, 640], [770, 250], [860, 560], [90, -40], [350, -70], [40, 800], [400, 790], [220, 840]];
+
 class TitleScene extends Phaser.Scene {
   constructor() { super('Title'); }
   create() {
+    const cx = MENU_W / 2, dev = this.sys.game.device;
     this.cameras.main.setBackgroundColor(COLORS.snow);
-    [[70, 140], [90, 330], [730, 250], [770, 615], [30, 615], [230, 60], [620, 60]].forEach(([x, y]) =>
-      this.add.image(x, y, 'tree').setOrigin(0.5, 0.9).setDepth(y));
-    this.add.image(610, 300, 'rock').setDepth(300);
+    fitMenuCamera(this);
+    onViewChange(this, () => fitMenuCamera(this));
 
-    addText(this, WIDTH / 2, HEIGHT * 0.17, 'SKI SIMULATOR', 66, COLORS.text, '900').setDepth(1000);
-    addText(this, WIDTH / 2, HEIGHT * 0.17 + 52, 'Outski the dire wolves. Eat apples. Deal with the consequences.', 18, COLORS.dim)
-      .setDepth(1000);
+    MENU_TREES.forEach(([x, y]) => sprite(this, x, y, 'tree').setOrigin(0.5, 0.9).setDepth(y));
+    sprite(this, 350, 305, 'rock').setDepth(305);
 
-    const sk = makeSkier(this, WIDTH / 2, HEIGHT * 0.54);
-    this.add.image(WIDTH / 2, HEIGHT * 0.54 + 2, 'shadow');
-    this.tweens.add({ targets: sk.c, x: WIDTH / 2 + 50, duration: 900, yoyo: true, repeat: -1, ease: 'Sine.InOut',
-      onUpdate: () => { const r = (sk.c.x - WIDTH / 2 - 25) / 25; sk.skis.rotation = -r * 0.5; sk.body.rotation = -r * 0.2; } });
-    const wolves = [-60, 0, 60].map((dx, i) =>
-      this.add.image(WIDTH / 2 + dx, HEIGHT * 0.54 - 80 - (i % 2) * 18, 'wolf0').setScale(1.1));
+    fitText(addText(this, cx, 70, 'SKI SIMULATOR', 54, COLORS.text, '900'), MENU_W - 24).setDepth(1000);
+    addText(this, cx, 132, 'Outski the dire wolves. Eat apples.\nDeal with the consequences.', 17, COLORS.dim).setDepth(1000);
+
+    const sk = makeSkier(this, cx - 25, 310);
+    sprite(this, cx, 312, 'shadow');
+    this.tweens.add({ targets: sk.c, x: cx + 25, duration: 900, yoyo: true, repeat: -1, ease: 'Sine.InOut',
+      onUpdate: () => { const r = (sk.c.x - cx) / 25; sk.skis.rotation = -r * 0.5; sk.body.rotation = -r * 0.2; } });
+    const wolves = [-60, 0, 60].map((dx, i) => sprite(this, cx + dx, 232 - (i % 2) * 18, 'wolf0', 1.1));
     this.time.addEvent({ delay: 120, loop: true, callback: () =>
       wolves.forEach((w, i) => w.setTexture((Math.floor(this.time.now / 120) + i) % 2 ? 'wolf1' : 'wolf0')) });
 
-    this.makeDifficultyPicker(HEIGHT * 0.655);
-    const prompt = addText(this, WIDTH / 2, HEIGHT * 0.77, 'Press SPACE or tap to start', 26, COLORS.accent, '800');
+    this.makeDifficultyPicker(392);
+    const prompt = addText(this, cx, 480, dev.os.desktop ? 'Press SPACE or click to start' : 'Tap to start', 24, COLORS.accent, '800');
     this.tweens.add({ targets: prompt, alpha: 0.3, duration: 700, yoyo: true, repeat: -1 });
-    addText(this, WIDTH / 2, HEIGHT * 0.835, '← →  steer     ↓  tuck     ↑  brake     SPACE  jump     P  pause     M  mute',
-      16, COLORS.text, '700');
-    addText(this, WIDTH / 2, HEIGHT * 0.9,
-      'Jump rocks and stumps. Hit ramps for big air. Trees always win.\nApples restore energy... but he WILL stop to eat them.', 15, COLORS.dim);
-    addMuteButton(this);
+
+    let y = 530;
+    const line = (str, color = COLORS.text) => { fitText(addText(this, cx, y, str, 14, color, '700'), MENU_W - 24); y += 22; };
+    if (dev.input.touch) line('Hold LEFT / RIGHT side to steer  ·  Swipe UP to jump');
+    if (dev.os.desktop || !dev.input.touch) {
+      line('← →  steer     ↓  tuck     ↑  brake     SPACE  jump');
+      line('P  pause     M  mute');
+    }
+    addText(this, cx, y + 26, 'Jump rocks & stumps. Hit ramps for big air.\nTrees always win. He WILL stop for apples.', 14, COLORS.dim);
+    addCornerButtons(this).layout(MENU_W - 6, 24);
 
     const start = () => { Sfx.unlock(); Sfx.play('start'); this.scene.start('Game', { difficulty: this.diff }); };
     this.input.keyboard.once('keydown-SPACE', start);
@@ -342,13 +474,13 @@ class TitleScene extends Phaser.Scene {
   makeDifficultyPicker(y) {
     this.diff = Store.get('difficulty', 'normal');
     if (!DIFFICULTIES[this.diff]) this.diff = 'normal';
-    const w = 124, h = 38, gap = 14, x0 = WIDTH / 2 - (w + gap);
-    const caption = addText(this, WIDTH / 2, y + 36, '', 15, COLORS.dim, '700');
+    const w = 124, h = 40, gap = 12, x0 = MENU_W / 2 - (w + gap);
+    const caption = addText(this, MENU_W / 2, y + 38, '', 15, COLORS.dim, '700');
     const btns = DIFF_KEYS.map((key, i) => {
       const x = x0 + i * (w + gap);
       const bg = this.add.graphics();
       const label = addText(this, x, y, (i + 1) + '  ' + DIFFICULTIES[key].label, 17, COLORS.text, '900');
-      const zone = this.add.zone(x, y, w, h).setInteractive({ useHandCursor: true });
+      const zone = this.add.zone(x, y, w, h + 8).setInteractive({ useHandCursor: true });
       zone.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); select(key); });
       return { key, x, bg, label };
     });
@@ -359,7 +491,7 @@ class TitleScene extends Phaser.Scene {
       btns.forEach(b => {
         const on = b.key === key;
         b.bg.clear().fillStyle(on ? COLORS.jacket : 0xffffff, on ? 1 : 0.85).fillRoundedRect(b.x - w / 2, y - h / 2, w, h, 10);
-        if (!on) b.bg.lineStyle(2, 0x1d2433, 0.2).strokeRoundedRect(b.x - w / 2, y - h / 2, w, h, 10);
+        if (!on) b.bg.lineStyle(2, COLORS.ink, 0.2).strokeRoundedRect(b.x - w / 2, y - h / 2, w, h, 10);
         b.label.setColor(on ? COLORS.white : COLORS.text);
         if (on) this.tweens.add({ targets: b.label, scale: { from: 1.15, to: 1 }, duration: 160 });
       });
@@ -379,14 +511,11 @@ class GameScene extends Phaser.Scene {
   init(data) { this.difficultyKey = (data && data.difficulty) || Store.get('difficulty', 'normal'); }
 
   create() {
-    const cam = this.cameras.main;
-    cam.setBackgroundColor(COLORS.snow);
-    cam.setScroll(-WIDTH / 2, -HEIGHT * TUNING.skierScreenY);
+    this.cameras.main.setBackgroundColor(COLORS.snow);
     this.elapsed = 0;
     this.over = false;
     this.bonus = 0;
     this.apples = 0;
-    this.shownScore = -1;
     this.sk = {
       x: 0, y: 0, heading: 0, speed: 0, vy: 0, state: 'ski', energy: 100, butt: 0,
       airStart: 0, airDur: 1, airUntil: -1, rampAir: false, wasAir: false, jumpReadyAt: 0,
@@ -402,17 +531,21 @@ class GameScene extends Phaser.Scene {
     this.nextHuffAt = 0;
     this.saidTired = false;
     this.usedKeyboard = false;
+    this.touchUsed = false;
+    this.touchInput = { left: false, right: false };   // written by the HUD scene each frame
     this.trail = [];
+    this.camX = 0;
+    this.updateCamera(1);
 
     // World: trail, skier, wolves
     this.trailG = this.add.graphics().setDepth(DEPTH.trail);
-    this.shadow = this.add.image(0, 0, 'shadow');
+    this.shadow = sprite(this, 0, 0, 'shadow');
     const sk = makeSkier(this, 0, 0);
     this.skier = sk.c; this.skis = sk.skis; this.buttImg = sk.butt; this.skBody = sk.body;
 
     this.wolves = [];
     for (let i = 0; i < TUNING.wolfCount; i++) {
-      const w = this.add.image(0, -9999, 'wolf0').setScale(1.15).setVisible(false);
+      const w = sprite(this, 0, -9999, 'wolf0', 1.15).setVisible(false);
       w.ox = (i - (TUNING.wolfCount - 1) / 2) * 46 + Phaser.Math.Between(-8, 8);
       w.oy = Phaser.Math.Between(0, 30) + (i % 2) * 26;
       w.phase = Phaser.Math.Between(0, 1000);
@@ -421,7 +554,7 @@ class GameScene extends Phaser.Scene {
     }
 
     const fx = tint => this.add.particles(0, 0, 'spark', {
-      speed: { min: 40, max: 170 }, lifespan: 480, scale: { start: 0.9, end: 0 },
+      speed: { min: 40, max: 170 }, lifespan: 480, scale: { start: 0.9 / TEX_RES, end: 0 },
       alpha: { start: 1, end: 0 }, tint, emitting: false,
     }).setDepth(DEPTH.fx);
     this.snowFx = fx(0xd4e4f3);
@@ -434,16 +567,9 @@ class GameScene extends Phaser.Scene {
     }).setOrigin(0.5, 1).setResolution(textRes(this)).setDepth(DEPTH.bubble).setVisible(false);
     this.bubbleUntil = 0;
 
-    // HUD
-    const hud = o => o.setScrollFactor(0).setDepth(DEPTH.hud);
-    this.scoreText = hud(addText(this, 20, 26, '0', 30, COLORS.text, '900').setOrigin(0, 0.5));
-    this.distText = hud(addText(this, 20, 55, '0 m', 16, COLORS.dim, '700').setOrigin(0, 0.5));
-    hud(addText(this, 20, 76, DIFFICULTIES[this.difficultyKey].label, 12, COLORS.dim, '800').setOrigin(0, 0.5));
-    this.energyLabel = hud(addText(this, 250, 18, 'ENERGY', 12, COLORS.dim, '800').setOrigin(0, 0.5));
-    this.energyG = hud(this.add.graphics());
-    this.buttText = hud(addText(this, 450, 36, '', 18, COLORS.text, '800').setOrigin(0, 0.5));
-    this.wolfText = hud(addText(this, 450, 62, '', 16, '#4a4e69', '900').setOrigin(0, 0.5));
-    addMuteButton(this);
+    // HUD lives in its own scene so it can be laid out in screen space at any size
+    this.scene.launch('Hud');
+    this.hud = this.scene.get('Hud');
 
     // Input
     this.cursors = this.input.keyboard.createCursorKeys();
@@ -452,7 +578,6 @@ class GameScene extends Phaser.Scene {
     this.input.keyboard.on('keydown', () => { this.usedKeyboard = true; });
     this.input.keyboard.on('keydown-P', this.pause, this);
     this.input.keyboard.on('keydown-ESC', this.pause, this);
-    if (this.sys.game.device.input.touch) this.makeTouchControls();
 
     // Auto-pause when the tab or window loses focus
     const onBlur = () => this.pause();
@@ -461,56 +586,33 @@ class GameScene extends Phaser.Scene {
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.game.events.off(Phaser.Core.Events.BLUR, onBlur);
       this.game.events.off(Phaser.Core.Events.HIDDEN, onBlur);
+      this.scene.stop('Hud');
     });
 
     this.time.delayedCall(400, () => this.say(pick(['Beautiful day for skiing!', 'Fresh powder!', 'Nothing could go wrong today.'])));
-  }
-
-  makeTouchControls() {
-    const hud = o => o.setScrollFactor(0).setDepth(DEPTH.hud);
-    this.btns = {
-      left:  { x: 85,          y: HEIGHT - 85, r: 60, label: '◀' },
-      right: { x: 225,         y: HEIGHT - 85, r: 60, label: '▶' },
-      jump:  { x: WIDTH - 95,  y: HEIGHT - 90, r: 66, label: 'JUMP' },
-    };
-    Object.values(this.btns).forEach(b => {
-      b.circle = hud(this.add.circle(b.x, b.y, b.r, 0x1d3557, 0.18));
-      hud(addText(this, b.x, b.y, b.label, b.label.length > 1 ? 22 : 34, COLORS.white, '900'));
-    });
-    const near = (p, b) => Phaser.Math.Distance.Between(p.x, p.y, b.x, b.y) < b.r + 18;
-    this.nearBtn = near;
-    this.input.on('pointerdown', p => {
-      if (near(p, this.btns.jump)) {
-        this.jump();
-        this.tweens.add({ targets: this.btns.jump.circle, scale: 0.88, duration: 70, yoyo: true });
-      }
-    });
-    const pauseBtn = hud(addText(this, WIDTH - 140, 24, 'II', 20, COLORS.dim, '900').setInteractive());
-    pauseBtn.on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); this.pause(); });
   }
 
   difficulty() { return Math.min(1, this.elapsed / (TUNING.rampSeconds * 1000)); }
   isAir() { return this.elapsed < this.sk.airUntil; }
 
   readInput() {
-    const k = this.cursors, w = this.wasd;
-    const inp = {
-      left: k.left.isDown || w.A.isDown, right: k.right.isDown || w.D.isDown,
-      up: k.up.isDown || w.W.isDown, down: k.down.isDown || w.S.isDown, autoCenter: false,
+    const k = this.cursors, w = this.wasd, t = this.touchInput;
+    return {
+      left: k.left.isDown || w.A.isDown || t.left, right: k.right.isDown || w.D.isDown || t.right,
+      up: k.up.isDown || w.W.isDown, down: k.down.isDown || w.S.isDown,
+      autoCenter: this.touchUsed && !this.usedKeyboard,
     };
-    if (this.btns) {
-      let tl = false, tr = false;
-      for (const p of this.input.manager.pointers) {
-        if (!p.isDown) continue;
-        if (this.nearBtn(p, this.btns.left)) tl = true;
-        if (this.nearBtn(p, this.btns.right)) tr = true;
-      }
-      this.btns.left.circle.setFillStyle(0x1d3557, tl ? 0.4 : 0.18);
-      this.btns.right.circle.setFillStyle(0x1d3557, tr ? 0.4 : 0.18);
-      inp.left = inp.left || tl; inp.right = inp.right || tr;
-      inp.autoCenter = !this.usedKeyboard;
-    }
-    return inp;
+  }
+
+  // Same world height on every screen; the width shows whatever the screen's shape allows
+  updateCamera(dt) {
+    const cam = this.cameras.main, T = TUNING;
+    cam.setZoom(View.worldZoom);
+    this.camX += (this.sk.x - this.camX) * Math.min(1, dt * 5);
+    const cy = this.sk.y + VIEW_H * (0.5 - T.skierScreenY);
+    cam.centerOn(this.camX, cy);
+    const w = View.w / View.worldZoom;
+    this.view = { left: this.camX - w / 2, right: this.camX + w / 2, top: cy - VIEW_H / 2, bottom: cy + VIEW_H / 2, w };
   }
 
   update(time, delta) {
@@ -570,31 +672,28 @@ class GameScene extends Phaser.Scene {
     this.updateWolves(dt);
     if (this.over) return;
 
-    // --- Camera, world streaming ---
-    const cam = this.cameras.main;
-    cam.scrollY = s.y - HEIGHT * T.skierScreenY;
-    cam.scrollX += (s.x - WIDTH / 2 - cam.scrollX) * Math.min(1, dt * 5);
-    this.streamWorld(cam);
-
+    this.updateCamera(dt);
+    this.streamWorld();
     this.drawSkier(nowAir);
     this.drawTrail(nowAir);
-    this.updateHud();
   }
 
   /* ---------- world ---------- */
-  streamWorld(cam) {
-    const T = TUNING, bottom = cam.scrollY + HEIGHT + 120, cx = cam.scrollX + WIDTH / 2;
+  streamWorld() {
+    const T = TUNING, v = this.view, bottom = v.bottom + 120, cx = this.camX;
+    const half = Math.max(T.spawnHalfWidth, v.w / 2 + 300);   // always cover the widest screen
     while (this.nextRowY < bottom) {
-      this.spawnRow(this.nextRowY, cx);
+      this.spawnRow(this.nextRowY, cx, half);
       this.nextRowY += lerp(T.rowSpacing[0], T.rowSpacing[1], this.difficulty()) * Phaser.Math.FloatBetween(0.7, 1.3);
     }
     if (this.nextAppleY < bottom) {
-      let x = this.sk.x + Phaser.Math.Between(-240, 240), tries = 0;
-      while (!this.clearAt(x, this.nextAppleY, 75) && ++tries < 12) x = this.sk.x + Phaser.Math.Between(-300, 300);
+      const spread = T.appleSpread;
+      let x = this.sk.x + Phaser.Math.Between(-spread, spread), tries = 0;
+      while (!this.clearAt(x, this.nextAppleY, 75) && ++tries < 12) x = this.sk.x + Phaser.Math.Between(-spread, spread);
       this.addObj('apple', x, this.nextAppleY);
       this.nextAppleY += Phaser.Math.Between(T.appleEveryPx[0], T.appleEveryPx[1]);
     }
-    const top = cam.scrollY - 120;
+    const top = v.top - 120;
     for (let i = this.objs.length - 1; i >= 0; i--) {
       const o = this.objs[i];
       if (o.y < top) {
@@ -612,11 +711,11 @@ class GameScene extends Phaser.Scene {
     return true;
   }
 
-  spawnRow(y, cx) {
+  spawnRow(y, cx, half) {
     const T = TUNING, C = T.chance, d = this.difficulty();
-    const n = Phaser.Math.Between(2, 2 + Math.round(d * 2));
+    const n = Math.round((Phaser.Math.Between(2, 2 + Math.round(d * 2))) * half / T.spawnHalfWidth);
     for (let i = 0; i < n; i++) {
-      const x = cx + Phaser.Math.Between(-T.spawnHalfWidth, T.spawnHalfWidth);
+      const x = cx + Phaser.Math.Between(-half, half);
       const yy = y + Phaser.Math.Between(-20, 20);
       if (yy < T.clearStartPx + 100 && Math.abs(x) < 140) continue;       // clear start
       if (!this.clearAt(x, yy, 48)) continue;
@@ -634,23 +733,25 @@ class GameScene extends Phaser.Scene {
       }
       else this.addObj('tree', x, yy);
     }
-    if (Math.random() < 0.7) this.addObj('deco', cx + Phaser.Math.Between(-T.spawnHalfWidth, T.spawnHalfWidth), y);
+    if (Math.random() < 0.7) this.addObj('deco', cx + Phaser.Math.Between(-half, half), y);
   }
 
   addObj(type, x, y) {
     const o = { type, x, y, done: false, sprites: [], r: 0 };
-    const img = (key, ox, oy) => { const sp = this.add.image(x, y, key).setOrigin(ox, oy).setDepth(y); o.sprites.push(sp); return sp; };
+    const img = (key, ox, oy, scale = 1) => {
+      const sp = sprite(this, x, y, key, scale).setOrigin(ox, oy).setDepth(y); o.sprites.push(sp); return sp;
+    };
     switch (type) {
-      case 'tree':  img('tree', 0.5, 0.9).setScale(Phaser.Math.FloatBetween(0.9, 1.2)); break;
+      case 'tree':  img('tree', 0.5, 0.9, Phaser.Math.FloatBetween(0.9, 1.2)); break;
       case 'rock':  img('rock', 0.5, 0.6); o.r = 16; break;
       case 'stump': img('stump', 0.5, 0.6); o.r = 13; break;
       case 'ramp':  img('ramp', 0.5, 0.5); break;
-      case 'deco':  img('bump', 0.5, 0.5).setDepth(DEPTH.deco).setScale(Phaser.Math.FloatBetween(0.7, 1.4)); break;
+      case 'deco':  img('bump', 0.5, 0.5, Phaser.Math.FloatBetween(0.7, 1.4)).setDepth(DEPTH.deco); break;
       case 'apple': {
         const sp = img('apple', 0.5, 0.7);
         const glow = img('appleGlow', 0.5, 0.5).setDepth(y - 1).setY(y - 12);
-        this.tweens.add({ targets: sp, scale: 1.12, duration: 450, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
-        this.tweens.add({ targets: glow, scale: 1.25, alpha: 0.6, duration: 450, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
+        this.tweens.add({ targets: sp, scale: 1.12 / TEX_RES, duration: 450, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
+        this.tweens.add({ targets: glow, scale: 1.25 / TEX_RES, alpha: 0.6, duration: 450, yoyo: true, repeat: -1, ease: 'Sine.InOut' });
         break;
       }
       case 'gate': {
@@ -732,7 +833,7 @@ class GameScene extends Phaser.Scene {
     s.jumpReadyAt = this.elapsed + TUNING.jumpCooldownMs;
     Sfx.play('land');
     this.snowFx.explode(s.rampAir ? 14 : 7, s.x, s.y + 4);
-    this.tweens.add({ targets: this.skBody, scaleX: 1.15, scaleY: 0.82, duration: 70, yoyo: true });
+    this.tweens.add({ targets: this.skBody, scaleX: 1.15 / TEX_RES, scaleY: 0.82 / TEX_RES, duration: 70, yoyo: true });
     if (s.rampAir) this.cameras.main.shake(90, 0.004);
     s.rampAir = false;
   }
@@ -769,7 +870,7 @@ class GameScene extends Phaser.Scene {
     this.apples++;
     this.addBonus(T.pts.apple, '', 0, 0);
     this.say(pick(['Ooh, an apple! Break time.', 'Snack break!', 'Mmm... apple.']));
-    this.tweens.add({ targets: this.skBody, y: 6, scaleY: 0.85, duration: 180 });
+    this.tweens.add({ targets: this.skBody, y: 6, scaleY: 0.85 / TEX_RES, duration: 180 });
 
     const at = (ms, fn) => this.time.delayedCall(ms, () => { if (!this.over) fn(); });
     [150, 420, 700].forEach(ms => at(ms, () => {
@@ -786,7 +887,7 @@ class GameScene extends Phaser.Scene {
       this.tweens.add({ targets: this.buttImg, scale: buttScale(s.butt), duration: 700, ease: 'Elastic.Out' });
       this.cameras.main.shake(160, 0.006);
       this.say(pick(['MY BUTT IS HUGE!', 'WHOA. BIG BUTT.', 'THAT BUTT IS ENORMOUS!', 'IS THAT MY BUTT?!']), true);
-      this.tweens.add({ targets: this.buttText, scale: 1.5, duration: 120, yoyo: true });
+      if (this.hud.ready) this.hud.popButt();
     });
     at(T.breakEatMs + T.breakRealizeMs + T.breakGoMs, () => {
       s.state = 'ski';
@@ -794,7 +895,7 @@ class GameScene extends Phaser.Scene {
       s.speed = T.maxSpeed * 0.8;
       s.boostUntil = this.elapsed + T.boostMs;
       s.invulnUntil = this.elapsed + 500;
-      this.tweens.add({ targets: this.skBody, y: 0, scaleY: 1, duration: 150 });
+      this.tweens.add({ targets: this.skBody, y: 0, scaleY: 1 / TEX_RES, duration: 150 });
       Sfx.play('whoosh');
       this.goldFx.explode(16, s.x, s.y - 10);
       this.say(pick(['Gotta burn this off!', 'CARDIO TIME!', 'Must... ski... faster!', 'Never again. (Until the next apple.)']));
@@ -811,7 +912,7 @@ class GameScene extends Phaser.Scene {
       this.gap = T.wolfStartGap;
       this.wolves.forEach(w => { w.wx = s.x + w.ox; });
       Sfx.play('howlUp'); this.time.delayedCall(650, () => Sfx.play('howlDn'));
-      this.banner('DIRE WOLVES!', 'They smell fear. And apples. Keep moving!');
+      if (this.hud.ready) this.hud.banner('DIRE WOLVES!', 'They smell fear. And apples. Keep moving!');
     }
     const d = (this.elapsed - this.wolfStart) / (T.wolfRampSeconds * 1000);
     this.wolfSpeed = lerp(T.wolfSpeed[0], T.wolfSpeed[1], d) * DIFFICULTIES[this.difficultyKey].wolfSpeedMult;
@@ -833,6 +934,8 @@ class GameScene extends Phaser.Scene {
       w.rotation = Phaser.Math.Clamp(-vx / Math.max(dt, 0.001) * 0.004, -0.5, 0.5);
     });
   }
+
+  wolvesOnScreen() { return this.gap < VIEW_H * TUNING.skierScreenY - 10; }
 
   caught() {
     const s = this.sk;
@@ -857,7 +960,7 @@ class GameScene extends Phaser.Scene {
   drawSkier(air) {
     const s = this.sk, h = this.airHeight();
     this.skier.setPosition(s.x, s.y - h).setScale(1 + h / 140).setDepth(s.y + 1);
-    this.shadow.setPosition(s.x, s.y + 2).setScale(1 - h / 150).setDepth(s.y - 0.5);
+    this.shadow.setPosition(s.x, s.y + 2).setScale((1 - h / 150) / TEX_RES).setDepth(s.y - 0.5);
     if (s.state === 'ski') {
       this.skis.rotation = -s.heading;
       this.skBody.rotation = -s.heading * 0.35;
@@ -897,30 +1000,7 @@ class GameScene extends Phaser.Scene {
   meters() { return Math.max(0, Math.floor(this.sk.y / TUNING.pxPerMeter)); }
   score() { return this.meters() + this.bonus; }
 
-  updateHud() {
-    const s = this.sk, T = TUNING, sc = this.score();
-    if (sc !== this.shownScore) { this.shownScore = sc; this.scoreText.setText(sc); }
-    this.distText.setText(this.meters() + ' m');
-
-    const g = this.energyG, x = 250, y = 28, w = 180, hh = 14, e = s.energy / 100;
-    const tired = s.energy < T.tiredThreshold;
-    const col = e > 0.6 ? 0x52b788 : !tired ? 0xffb703 : 0xe63946;
-    g.clear().fillStyle(0x1d2433, 0.12).fillRoundedRect(x, y, w, hh, 7);
-    if (e > 0.02) g.fillStyle(col).fillRoundedRect(x, y, Math.max(hh, w * e), hh, 7);
-    this.energyLabel.setText(tired ? 'TIRED... FIND AN APPLE' : this.elapsed < s.boostUntil ? 'BUTT-POWERED BOOST!' : 'ENERGY')
-      .setColor(tired ? COLORS.accent : this.elapsed < s.boostUntil ? COLORS.gold : COLORS.dim);
-
-    this.buttText.setText(s.butt > 0 ? 'BUTT SIZE ' + (s.butt + 1) : '');
-
-    if (!this.wolvesActive) { this.wolfText.setText(''); return; }
-    const onScreen = this.gap < HEIGHT * T.skierScreenY - 10;
-    const m = Math.max(0, Math.round(this.gap / T.pxPerMeter));
-    this.wolfText.setText(onScreen ? '' : 'WOLVES ' + m + ' m BEHIND')
-      .setColor(this.gap < 400 ? COLORS.accent : '#4a4e69')
-      .setAlpha(this.gap < 400 ? 0.6 + 0.4 * Math.abs(Math.sin(this.elapsed / 150)) : 1);
-  }
-
-  /* ---------- UI bits ---------- */
+  /* ---------- world-space text ---------- */
   say(str, big = false) {
     this.bubble.setText(str).setFontSize(big ? 24 : 18).setColor(big ? COLORS.accent : COLORS.text).setVisible(true);
     this.bubbleUntil = this.elapsed + (big ? 1300 : 1700);
@@ -937,31 +1017,149 @@ class GameScene extends Phaser.Scene {
   addBonus(pts, label, x, y) {
     this.bonus += pts;
     if (label) this.popText(x, y, label);
-    this.tweens.add({ targets: this.scoreText, scale: 1.3, duration: 90, yoyo: true });
-  }
-
-  banner(title, sub) {
-    const t1 = addText(this, WIDTH / 2, HEIGHT * 0.45, title, 44, COLORS.accent, '900').setScrollFactor(0).setDepth(DEPTH.hud).setScale(0);
-    const t2 = addText(this, WIDTH / 2, HEIGHT * 0.45 + 44, sub, 18, COLORS.text, '700').setScrollFactor(0).setDepth(DEPTH.hud).setAlpha(0);
-    this.tweens.add({ targets: t1, scale: 1, duration: 400, ease: 'Back.Out' });
-    this.tweens.add({ targets: t2, alpha: 1, duration: 300, delay: 200 });
-    this.tweens.add({ targets: [t1, t2], alpha: 0, duration: 500, delay: 2200, onComplete: () => { t1.destroy(); t2.destroy(); } });
+    if (this.hud.ready) this.hud.popScore();
   }
 
   pause() {
     if (this.over || !this.scene.isActive()) return;
     this.scene.launch('Pause');
     this.scene.pause();
+    this.scene.pause('Hud');
+  }
+}
+
+/* HUD: screen-space overlay above the game. Anchored to screen edges and phone safe areas. */
+class HudScene extends Phaser.Scene {
+  constructor() { super('Hud'); }
+  create() {
+    this.ready = false;
+    this.g = this.scene.get('Game');
+    this.shownScore = -1;
+    this.edgeL = this.add.rectangle(0, 0, 10, 10, COLORS.ski, 0).setOrigin(0);
+    this.edgeR = this.add.rectangle(0, 0, 10, 10, COLORS.ski, 0).setOrigin(1, 0);
+    this.scoreText = addText(this, 0, 0, '0', 30, COLORS.text, '900').setOrigin(0, 0.5);
+    this.distText = addText(this, 0, 0, '0 m', 16, COLORS.dim, '700').setOrigin(0, 0.5);
+    this.diffText = addText(this, 0, 0, DIFFICULTIES[this.g.difficultyKey].label, 12, COLORS.dim, '800').setOrigin(0, 0.5);
+    this.energyLabel = addText(this, 0, 0, 'ENERGY', 12, COLORS.dim, '800');
+    this.energyG = this.add.graphics();
+    this.buttText = addText(this, 0, 0, '', 16, COLORS.text, '800');
+    this.wolfText = addText(this, 0, 0, '', 15, '#4a4e69', '900');
+    this.corner = addCornerButtons(this, { pause: () => this.g.pause() });
+
+    this.setupTouch();
+    if (this.sys.game.device.input.touch) {
+      this.hint = this.add.text(0, 0, 'Hold LEFT or RIGHT side to steer\nSwipe UP to jump', {
+        fontFamily: FONT, fontSize: '17px', fontStyle: '800', color: COLORS.white, align: 'center',
+        backgroundColor: 'rgba(29,36,51,0.78)', padding: { x: 16, y: 10 },
+      }).setOrigin(0.5, 1).setResolution(textRes(this));
+      this.tweens.add({ targets: this.hint, alpha: 0, delay: 4500, duration: 600, onComplete: () => this.hint.setVisible(false) });
+    }
+    this.layout();
+    onViewChange(this, () => this.layout());
+    this.ready = true;
+  }
+
+  layout() {
+    this.cameras.main.setZoom(View.uiZoom).centerOn(View.uw / 2, View.uh / 2);
+    const sa = View.safe, uw = View.uw, uh = View.uh;
+    const L = 14 + sa.left, T = sa.top, cx = uw / 2;
+    this.scoreText.setPosition(L, T + 26);
+    this.distText.setPosition(L, T + 54);
+    this.diffText.setPosition(L, T + 74);
+    const bw = Phaser.Math.Clamp(uw * 0.3, 110, 200);
+    this.bar = { x: cx - bw / 2, y: T + 24, w: bw, h: 12 };
+    this.energyLabel.setPosition(cx, T + 13);
+    this.buttText.setPosition(cx, T + 52);
+    this.wolfText.setPosition(cx, T + 73);
+    this.corner.layout(uw - 8 - sa.right, T + 26);
+    this.edgeL.setPosition(0, 0).setSize(44, uh);
+    this.edgeR.setPosition(uw, 0).setSize(44, uh);
+    if (this.hint) this.hint.setPosition(cx, uh - 40 - sa.bottom);
+    this.bannerY = uh * 0.42;
+    this.corner.setDepth(10);
+  }
+
+  // Thumb zones: hold the left/right half to steer, swipe up to jump
+  setupTouch() {
+    this.touches = new Map();
+    this.input.on('pointerdown', p => {
+      Sfx.unlock();
+      this.touches.set(p.id, { x0: p.x, y0: p.y, swiped: false });
+      if (p.wasTouch) this.g.touchUsed = true;
+    });
+    this.input.on('pointermove', p => {
+      const t = this.touches.get(p.id);
+      if (!t || t.swiped || !p.isDown) return;
+      const up = (t.y0 - p.y) / View.uiZoom, side = Math.abs(p.x - t.x0) / View.uiZoom;
+      if (up > TUNING.swipeJumpPx && up > side) { t.swiped = true; this.g.jump(); }
+    });
+    const end = p => this.touches.delete(p.id);
+    this.input.on('pointerup', end);
+    this.input.on('pointerupoutside', end);
+  }
+
+  readTouch() {
+    let left = false, right = false;
+    for (const p of this.input.manager.pointers) {
+      const t = p.isDown && this.touches.get(p.id);
+      if (!t || t.swiped) continue;
+      if (p.x < View.w / 2) left = true; else right = true;
+    }
+    return { left, right };
+  }
+
+  update() {
+    const g = this.g, s = g.sk, T = TUNING;
+    if (!s) return;
+    const touch = this.readTouch();
+    g.touchInput = touch;
+    this.edgeL.fillAlpha = touch.left ? 0.1 : 0;
+    this.edgeR.fillAlpha = touch.right ? 0.1 : 0;
+
+    const sc = g.score();
+    if (sc !== this.shownScore) { this.shownScore = sc; this.scoreText.setText(sc); }
+    this.distText.setText(g.meters() + ' m');
+
+    const b = this.bar, e = s.energy / 100, tired = s.energy < T.tiredThreshold, boosting = g.elapsed < s.boostUntil;
+    const col = e > 0.6 ? 0x52b788 : !tired ? 0xffb703 : 0xe63946;
+    this.energyG.clear().fillStyle(COLORS.ink, 0.12).fillRoundedRect(b.x, b.y, b.w, b.h, 6);
+    if (e > 0.02) this.energyG.fillStyle(col).fillRoundedRect(b.x, b.y, Math.max(b.h, b.w * e), b.h, 6);
+    this.energyLabel.setText(tired ? 'TIRED... FIND AN APPLE' : boosting ? 'BUTT-POWERED BOOST!' : 'ENERGY')
+      .setColor(tired ? COLORS.accent : boosting ? COLORS.gold : COLORS.dim);
+
+    this.buttText.setText(s.butt > 0 ? 'BUTT SIZE ' + (s.butt + 1) : '');
+
+    if (!g.wolvesActive || g.wolvesOnScreen()) { this.wolfText.setText(''); return; }
+    const m = Math.max(0, Math.round(g.gap / T.pxPerMeter));
+    this.wolfText.setText('WOLVES ' + m + ' m BEHIND')
+      .setColor(g.gap < 400 ? COLORS.accent : '#4a4e69')
+      .setAlpha(g.gap < 400 ? 0.6 + 0.4 * Math.abs(Math.sin(g.elapsed / 150)) : 1);
+  }
+
+  popScore() { this.tweens.add({ targets: this.scoreText, scale: 1.3, duration: 90, yoyo: true }); }
+  popButt() { this.tweens.add({ targets: this.buttText, scale: 1.5, duration: 120, yoyo: true }); }
+
+  banner(title, sub) {
+    const cx = View.uw / 2, y = this.bannerY;
+    const t1 = fitText(addText(this, cx, y, title, 42, COLORS.accent, '900'), View.uw - 30);
+    const full = t1.scale;
+    t1.setScale(0);
+    const t2 = fitText(addText(this, cx, y + 42, sub, 17, COLORS.text, '700'), View.uw - 30).setAlpha(0);
+    this.tweens.add({ targets: t1, scale: full, duration: 400, ease: 'Back.Out' });
+    this.tweens.add({ targets: t2, alpha: 1, duration: 300, delay: 200 });
+    this.tweens.add({ targets: [t1, t2], alpha: 0, duration: 500, delay: 2200, onComplete: () => { t1.destroy(); t2.destroy(); } });
   }
 }
 
 class PauseScene extends Phaser.Scene {
   constructor() { super('Pause'); }
   create() {
-    this.add.rectangle(0, 0, WIDTH, HEIGHT, 0x1d2433, 0.6).setOrigin(0);
-    addText(this, WIDTH / 2, HEIGHT / 2 - 20, 'PAUSED', 56, COLORS.white, '900');
-    addText(this, WIDTH / 2, HEIGHT / 2 + 40, 'Tap or press P to resume', 22, '#dde7f0');
-    const resume = () => { this.scene.resume('Game'); this.scene.stop(); };
+    fitMenuCamera(this);
+    onViewChange(this, () => fitMenuCamera(this));
+    this.add.rectangle(MENU_W / 2, MENU_H / 2, 20000, 20000, COLORS.ink, 0.6);
+    addText(this, MENU_W / 2, MENU_H / 2 - 24, 'PAUSED', 56, COLORS.white, '900');
+    addText(this, MENU_W / 2, MENU_H / 2 + 36, this.sys.game.device.os.desktop ? 'Click or press P to resume' : 'Tap to resume', 22, '#dde7f0');
+    const resume = () => { this.scene.resume('Game'); this.scene.resume('Hud'); this.scene.stop(); };
     this.time.delayedCall(150, () => {
       this.input.keyboard.once('keydown-P', resume);
       this.input.keyboard.once('keydown-ESC', resume);
@@ -975,31 +1173,46 @@ class GameOverScene extends Phaser.Scene {
   constructor() { super('GameOver'); }
   init(data) { this.data_ = data || {}; }
   create() {
-    const d = this.data_, score = d.score || 0;
+    const d = this.data_, score = d.score || 0, cx = MENU_W / 2, dev = this.sys.game.device;
     this.cameras.main.setBackgroundColor(COLORS.snow);
+    fitMenuCamera(this);
+    onViewChange(this, () => fitMenuCamera(this));
     const diff = DIFFICULTIES[d.difficulty] ? d.difficulty : 'normal';
     const prevBest = getBest(diff);
     const isBest = score > prevBest;
     if (isBest) Store.set('best_' + diff, score);
 
-    this.add.image(WIDTH / 2 - 270, HEIGHT * 0.2, 'wolf0').setScale(1.4).setAngle(-20);
-    this.add.image(WIDTH / 2 + 270, HEIGHT * 0.2, 'wolf1').setScale(1.4).setAngle(20);
-    addText(this, WIDTH / 2, HEIGHT * 0.2, 'THE DIRE WOLVES\nGOT YOU', 42, COLORS.text, '900');
-    const scoreT = addText(this, WIDTH / 2, HEIGHT * 0.43, String(score), 76, COLORS.accent, '900').setScale(0);
+    MENU_TREES.slice(2).forEach(([x, y]) => sprite(this, x, y, 'tree').setOrigin(0.5, 0.9).setDepth(y));
+    sprite(this, cx - 90, 70, 'wolf0', 1.4).setAngle(-20);
+    sprite(this, cx + 90, 70, 'wolf1', 1.4).setAngle(20);
+    fitText(addText(this, cx, 160, 'THE DIRE WOLVES\nGOT YOU', 38, COLORS.text, '900'), MENU_W - 24);
+    const scoreT = addText(this, cx, 272, String(score), 76, COLORS.accent, '900').setScale(0);
     this.tweens.add({ targets: scoreT, scale: 1, duration: 400, ease: 'Back.Out' });
     const buttLine = d.butt ? ' · butt size ' + (d.butt + 1) : '';
-    addText(this, WIDTH / 2, HEIGHT * 0.53, (d.meters || 0) + ' m · ' + (d.apples || 0) + (d.apples === 1 ? ' apple' : ' apples') + buttLine, 20, COLORS.dim, '700');
-    addText(this, WIDTH / 2, HEIGHT * 0.6,
-      (isBest ? '★ New ' + DIFFICULTIES[diff].label + ' best! ★' : DIFFICULTIES[diff].label + ' best: ' + Math.max(prevBest, score)), 22, isBest ? COLORS.gold : COLORS.dim, '800');
-    const prompt = addText(this, WIDTH / 2, HEIGHT * 0.74, 'Press SPACE or tap to ski again', 24, COLORS.text, '800');
+    fitText(addText(this, cx, 340, (d.meters || 0) + ' m · ' + (d.apples || 0) + (d.apples === 1 ? ' apple' : ' apples') + buttLine,
+      19, COLORS.dim, '700'), MENU_W - 24);
+    addText(this, cx, 380,
+      (isBest ? '★ New ' + DIFFICULTIES[diff].label + ' best! ★' : DIFFICULTIES[diff].label + ' best: ' + Math.max(prevBest, score)),
+      21, isBest ? COLORS.gold : COLORS.dim, '800');
+    const prompt = addText(this, cx, 466, dev.os.desktop ? 'Press SPACE or click to ski again' : 'Tap to ski again', 23, COLORS.text, '800');
     this.tweens.add({ targets: prompt, alpha: 0.3, duration: 700, yoyo: true, repeat: -1 });
-    addText(this, WIDTH / 2, HEIGHT * 0.81, 'ESC: change difficulty', 16, COLORS.dim, '700');
+
+    // "Change difficulty" is a real button so it works on phones too (ESC on keyboards)
+    const bw = 220, bh = 40, by = 540;
+    this.add.graphics().fillStyle(0xffffff, 0.9).fillRoundedRect(cx - bw / 2, by - bh / 2, bw, bh, 10)
+      .lineStyle(2, COLORS.ink, 0.2).strokeRoundedRect(cx - bw / 2, by - bh / 2, bw, bh, 10);
+    addText(this, cx, by, 'CHANGE DIFFICULTY', 16, COLORS.text, '900');
+    if (dev.os.desktop) addText(this, cx, by + 36, 'or press ESC', 13, COLORS.dim, '700');
+    const toTitle = () => this.scene.start('Title');
+    this.add.zone(cx, by, bw, bh + 8).setInteractive({ useHandCursor: true })
+      .on('pointerdown', (p, lx, ly, e) => { e && e.stopPropagation(); toTitle(); });
+
     Sfx.play('over');
-    addMuteButton(this);
+    addCornerButtons(this).layout(MENU_W - 6, 24);
 
     this.time.delayedCall(400, () => {
       const again = () => { Sfx.play('start'); this.scene.start('Game', { difficulty: diff }); };
-      this.input.keyboard.once('keydown-ESC', () => this.scene.start('Title'));
+      this.input.keyboard.once('keydown-ESC', toTitle);
       this.input.keyboard.once('keydown-SPACE', again);
       this.input.keyboard.once('keydown-ENTER', again);
       this.input.once('pointerdown', again);
@@ -1013,12 +1226,13 @@ class GameOverScene extends Phaser.Scene {
 window.game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
-  width: WIDTH,
-  height: HEIGHT,
+  width: View.w,
+  height: View.h,
   backgroundColor: '#f3f7fb',
-  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+  // Canvas is device-pixel sized and CSS-scaled down by the DPR; we handle resizing ourselves
+  scale: { mode: Phaser.Scale.NONE, zoom: 1 / View.dpr },
   input: { activePointers: 3 },
-  scene: [BootScene, TitleScene, GameScene, PauseScene, GameOverScene],
+  scene: [BootScene, TitleScene, GameScene, HudScene, PauseScene, GameOverScene],
 });
 </script>
 </body>

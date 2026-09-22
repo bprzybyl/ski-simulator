@@ -41,9 +41,16 @@ tid = send('Target.createTarget', {'url': 'about:blank'})['targetId']
 sid = send('Target.attachToTarget', {'targetId': tid, 'flatten': True})['sessionId']
 send('Runtime.enable', sid=sid); send('Page.enable', sid=sid)
 send('Emulation.setFocusEmulationEnabled', {'enabled': True}, sid=sid)
+def emulate(spec):  # "w,h,dpr" → phone-like touch screen
+    w, h, d = [float(v) for v in spec.split(',')]
+    send('Emulation.setDeviceMetricsOverride', {'width': int(w), 'height': int(h), 'deviceScaleFactor': d, 'mobile': True}, sid=sid)
+    send('Emulation.setTouchEmulationEnabled', {'enabled': True, 'maxTouchPoints': 5}, sid=sid)
+if os.environ.get('MOBILE'): emulate(os.environ['MOBILE'])
 t0 = time.time(); send('Page.navigate', {'url': url}, sid=sid)
 for at, name in shots:
     while time.time() - t0 < at: time.sleep(0.02)
+    if name.startswith('@resize='):  # e.g. 6:@resize=844,390,3 rotates the emulated phone
+        emulate(name.split('=', 1)[1]); print('[resize]', name, flush=True); continue
     data = send('Page.captureScreenshot', {'format': 'png'}, sid=sid)['data']
     open(os.path.join(os.environ['TMPDIR'], name + '.png'), 'wb').write(base64.b64decode(data))
     print('[shot]', name, round(time.time() - t0, 1), flush=True)
