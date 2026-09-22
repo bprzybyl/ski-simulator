@@ -4,7 +4,9 @@ A SkiFree-style downhill skiing game for the browser. Outski a pack of dire wolv
 
 ## Play
 
-Open `index.html` in a browser. It's a single file with no build step; it loads Phaser 3 from a CDN, so the first load needs an internet connection.
+### ▶ [Play in your browser](https://bprzybyl.github.io/ski-simulator/)
+
+Or run it locally: open `index.html` in a browser. It's a single file with no build step; it loads Phaser 3 from a CDN, so the first load needs an internet connection.
 
 | Key | Action |
 | --- | --- |
